@@ -1261,6 +1261,26 @@ impl Value {
         Ok(value.unwrap_or(Value::UNDEFINED))
     }
 
+    /// Looks up an attribute allowing undefined chaining.
+    ///
+    /// This is like [`get_attr`] but allows accessing attributes on undefined values,
+    /// returning [`UNDEFINED`](Self::UNDEFINED) instead of an error. This enables
+    /// patterns like `{{ undefined_var.field | default("fallback") }}` to work.
+    ///
+    /// ```
+    /// # use minijinja::value::Value;
+    /// let value = Value::UNDEFINED;
+    /// let result = value.get_attr_chainable("missing_field");
+    /// assert!(result.is_undefined());
+    /// ```
+    pub fn get_attr_chainable(&self, key: &str) -> Value {
+        match self.0 {
+            ValueRepr::Undefined(_) => Value::UNDEFINED,
+            ValueRepr::Object(ref dy) => dy.get_value(&Value::from(key)).unwrap_or(Value::UNDEFINED),
+            _ => Value::UNDEFINED,
+        }
+    }
+
     /// Alternative lookup strategy without error handling exclusively for context
     /// resolution.
     ///
