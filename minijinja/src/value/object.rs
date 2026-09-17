@@ -7,7 +7,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use crate::error::{Error, ErrorKind};
-use crate::value::{mapped_enumerator, Value};
+use crate::value::{mapped_enumerator, Value, ValueRepr};
 use crate::vm::State;
 
 /// A trait that represents a dynamic object.
@@ -183,6 +183,15 @@ pub trait Object: fmt::Debug + Send + Sync {
         None
     }
 
+    /// Given a string key, looks up the associated value.
+    ///
+    /// By default this creates a temporary value and calls [`get_value`](Self::get_value).
+    /// Implementors can override this to avoid temporary allocations for common
+    /// string-key lookups.
+    fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<Value> {
+        self.get_value(&Value::from(key))
+    }
+
     /// Enumerates the object.
     ///
     /// The engine uses the returned enumerator to implement iteration and
@@ -244,10 +253,7 @@ pub trait Object: fmt::Debug + Send + Sync {
         method: &str,
         args: &[Value],
     ) -> Result<Value, Error> {
-        if let Some(value) = self.get_value(&Value::from(method)) {
-            return value.call(state, args);
-        }
-
+        let (_, _, _) = (state, method, args);
         Err(Error::from(ErrorKind::UnknownMethod))
     }
 
@@ -333,7 +339,21 @@ macro_rules! impl_object_helpers {
                     })))
                 }
                 Enumerator::Iter(iter) => Some(iter),
+                Enumerator::KeyValueIter(iter) => {
+                    if let ObjectRepr::Map = self.repr() {
+                        Some(Box::new(iter.map(|(key, _)| key)))
+                    } else {
+                        Some(Box::new(iter.map(|(key, val)| [key, val].into())))
+                    }
+                }
                 Enumerator::RevIter(iter) => Some(Box::new(iter)),
+                Enumerator::RevKeyValueIter(iter) => {
+                    if let ObjectRepr::Map = self.repr() {
+                        Some(Box::new(iter.map(|(key, _)| key)))
+                    } else {
+                        Some(Box::new(iter.map(|(key, val)| [key, val].into())))
+                    }
+                }
                 Enumerator::Str(s) => Some(Box::new(s.iter().copied().map(Value::from))),
                 Enumerator::Values(v) => Some(Box::new(v.into_iter())),
             }
@@ -343,18 +363,25 @@ macro_rules! impl_object_helpers {
         $vis fn try_iter_pairs(
             self: $self_ty,
         ) -> Option<Box<dyn Iterator<Item = (Value, Value)> + Send + Sync>> {
-            let iter = some!(self.try_iter());
-            let repr = self.repr();
-            let self_clone = self.clone();
-            Some(Box::new(iter.enumerate().map(move |(idx, item)| {
-                match repr {
-                    ObjectRepr::Map => {
-                        let value = self_clone.get_value(&item);
-                        (item, value.unwrap_or_default())
+            if let ObjectRepr::Map = self.repr() {
+                match self.enumerate() {
+                    Enumerator::KeyValueIter(iter) => Some(iter),
+                    Enumerator::RevKeyValueIter(iter) => Some(Box::new(iter)),
+                    _ => {
+                        let iter = some!(self.try_iter());
+                        let self_clone = self.clone();
+                        Some(Box::new(iter.map(move |key| {
+                            let value = self_clone.get_value(&key).unwrap_or_default();
+                            (key, value)
+                        })))
                     }
-                    _ => (Value::from(idx), item)
                 }
-            })))
+            } else {
+                let iter = some!(self.try_iter());
+                Some(Box::new(iter.enumerate().map(move |(idx, item)| {
+                    (Value::from(idx), item)
+                })))
+            }
         }
     };
 }
@@ -367,6 +394,46 @@ pub trait ObjectExt: Object + Send + Sync + 'static {
     /// to return an [`Iterator`].  This iterator is then wrapped in an
     /// [`Enumerator::Iter`].  This allows one to create an iterator that borrows
     /// out of the object.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use std::collections::HashSet;
+    /// use std::sync::Arc;
+    /// use minijinja::value::{Value, Object, ObjectRepr, ObjectExt, Enumerator};
+    ///
+    /// #[derive(Debug)]
+    /// struct CustomSet(HashSet<usize>);
+    ///
+    /// impl Object for CustomSet {
+    ///     fn repr(self: &Arc<Self>) -> ObjectRepr {
+    ///         ObjectRepr::Iterable
+    ///     }
+    ///
+    ///     fn enumerate(self: &Arc<Self>) -> Enumerator {
+    ///         self.mapped_enumerator(|this| {
+    ///             Box::new(this.0.iter().copied().map(Value::from))
+    ///         })
+    ///     }
+    /// }
+    /// ```
+    fn mapped_enumerator<F>(self: &Arc<Self>, maker: F) -> Enumerator
+    where
+        F: for<'a> FnOnce(&'a Self) -> Box<dyn Iterator<Item = Value> + Send + Sync + 'a>
+            + Send
+            + Sync
+            + 'static,
+        Self: Sized,
+    {
+        mapped_enumerator(self, maker)
+    }
+
+    /// Creates a new key-value pair enumerator that projects into the given object.
+    ///
+    /// It takes a method that is passed a reference to `self` and is expected to
+    /// return an [`Iterator`].  This iterator is then wrapped in an
+    /// [`Enumerator::KeyValueIter`].  This allows one to create an iterator that
+    /// borrows out of the object.
     ///
     /// # Example
     ///
@@ -384,21 +451,46 @@ pub trait ObjectExt: Object + Send + Sync + 'static {
     ///     }
     ///
     ///     fn enumerate(self: &Arc<Self>) -> Enumerator {
-    ///         self.mapped_enumerator(|this| {
-    ///             Box::new(this.0.keys().copied().map(Value::from))
+    ///         self.mapped_key_value_enumerator(|this| {
+    ///             Box::new(this.0.iter().map(|(&k, &v)| (Value::from(k), Value::from(v))))
     ///         })
     ///     }
     /// }
     /// ```
-    fn mapped_enumerator<F>(self: &Arc<Self>, maker: F) -> Enumerator
+    fn mapped_key_value_enumerator<F>(self: &Arc<Self>, maker: F) -> Enumerator
     where
-        F: for<'a> FnOnce(&'a Self) -> Box<dyn Iterator<Item = Value> + Send + Sync + 'a>
+        F: for<'a> FnOnce(&'a Self) -> Box<dyn Iterator<Item = (Value, Value)> + Send + Sync + 'a>
             + Send
             + Sync
             + 'static,
         Self: Sized,
     {
-        mapped_enumerator(self, maker)
+        struct Iter {
+            iter: Box<dyn Iterator<Item = (Value, Value)> + Send + Sync + 'static>,
+            _object: DynObject,
+        }
+
+        impl Iterator for Iter {
+            type Item = (Value, Value);
+
+            fn next(&mut self) -> Option<Self::Item> {
+                self.iter.next()
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                self.iter.size_hint()
+            }
+        }
+
+        // SAFETY: this is safe because the object is kept alive by the iter
+        let iter = unsafe {
+            std::mem::transmute::<
+                Box<dyn Iterator<Item = _>>,
+                Box<dyn Iterator<Item = _> + Send + Sync>,
+            >(maker(self))
+        };
+        let _object = DynObject::new(self.clone());
+        Enumerator::KeyValueIter(Box::new(Iter { iter, _object }))
     }
 
     /// Creates a new reversible iterator enumeration that projects into the given object.
@@ -411,21 +503,21 @@ pub trait ObjectExt: Object + Send + Sync + 'static {
     /// # Example
     ///
     /// ```
-    /// # use std::collections::HashMap;
+    /// # use std::collections::BTreeSet;
     /// use std::sync::Arc;
     /// use std::ops::Range;
     /// use minijinja::value::{Value, Object, ObjectExt, ObjectRepr, Enumerator};
     ///
     /// #[derive(Debug)]
-    /// struct VecView(Vec<usize>);
+    /// struct OrderedSet(BTreeSet<usize>);
     ///
-    /// impl Object for VecView {
+    /// impl Object for OrderedSet {
     ///     fn repr(self: &Arc<Self>) -> ObjectRepr {
     ///         ObjectRepr::Iterable
     ///     }
     ///
     ///     fn enumerate(self: &Arc<Self>) -> Enumerator {
-    ///         self.mapped_enumerator(|this| {
+    ///         self.mapped_rev_enumerator(|this| {
     ///             Box::new(this.0.iter().cloned().map(Value::from))
     ///         })
     ///     }
@@ -476,6 +568,80 @@ pub trait ObjectExt: Object + Send + Sync + 'static {
         };
         let _object = DynObject::new(self.clone());
         Enumerator::RevIter(Box::new(Iter { iter, _object }))
+    }
+
+    /// Creates reversible key-value pair enumeration that projects into the given object.
+    ///
+    /// It takes a method that is passed a reference to `self` and is expected to
+    /// return a [`DoubleEndedIterator`].  This iterator is then wrapped in an
+    /// [`Enumerator::RevKeyValueIter`].  This allows one to create an iterator that
+    /// borrows out of the object and is reversible.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use std::collections::BTreeMap;
+    /// use std::sync::Arc;
+    /// use minijinja::value::{Value, Object, ObjectExt, Enumerator};
+    ///
+    /// #[derive(Debug)]
+    /// struct CustomMap(BTreeMap<usize, i64>);
+    ///
+    /// impl Object for CustomMap {
+    ///     fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+    ///         self.0.get(&key.as_usize()?).copied().map(Value::from)
+    ///     }
+    ///
+    ///     fn enumerate(self: &Arc<Self>) -> Enumerator {
+    ///         self.mapped_rev_key_value_enumerator(|this| {
+    ///             Box::new(this.0.iter().map(|(&k, &v)| (Value::from(k), Value::from(v))))
+    ///         })
+    ///     }
+    /// }
+    /// ```
+    fn mapped_rev_key_value_enumerator<F>(self: &Arc<Self>, maker: F) -> Enumerator
+    where
+        F: for<'a> FnOnce(
+                &'a Self,
+            )
+                -> Box<dyn DoubleEndedIterator<Item = (Value, Value)> + Send + Sync + 'a>
+            + Send
+            + Sync
+            + 'static,
+        Self: Sized,
+    {
+        struct Iter {
+            iter: Box<dyn DoubleEndedIterator<Item = (Value, Value)> + Send + Sync + 'static>,
+            _object: DynObject,
+        }
+
+        impl Iterator for Iter {
+            type Item = (Value, Value);
+
+            fn next(&mut self) -> Option<Self::Item> {
+                self.iter.next()
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                self.iter.size_hint()
+            }
+        }
+
+        impl DoubleEndedIterator for Iter {
+            fn next_back(&mut self) -> Option<Self::Item> {
+                self.iter.next_back()
+            }
+        }
+
+        // SAFETY: this is safe because the `Iter` will keep our object alive.
+        let iter = unsafe {
+            std::mem::transmute::<
+                Box<dyn DoubleEndedIterator<Item = _>>,
+                Box<dyn DoubleEndedIterator<Item = _> + Send + Sync>,
+            >(maker(self))
+        };
+        let _object = DynObject::new(self.clone());
+        Enumerator::RevKeyValueIter(Box::new(Iter { iter, _object }))
     }
 
     impl_object_helpers!(&Arc<Self>);
@@ -547,6 +713,29 @@ pub enum Enumerator {
     /// | yes      | sometimes known |
     Iter(Box<dyn Iterator<Item = Value> + Send + Sync>),
 
+    /// A dynamic iterator over key value pairs.
+    ///
+    /// This enumerator allows efficient iteration over the items of a mapping in the
+    /// contexts where both key and value are required (e.g. `|items` and `|dictsort`
+    /// filters).
+    ///
+    /// Objects with [`ObjectRepr::Map`] are encouraged to return this enumerator if
+    /// their iterator naturally yields (key, value) pairs.  Note that it does NOT
+    /// change the iteration behavior of the map in the templates, which is to
+    /// iterate over keys.  In the context where a value corresponding the key is
+    /// also required, the previous `Iter` option would call [`Object::get_value`],
+    /// which incurs unnecessary cost of the map lookup.  This enumerator avoids the
+    /// cost.
+    ///
+    /// For [`ObjectRepr::Iterable`], the iteration behavior is consistent with the
+    /// `Iter` alternative, i.e. the iteration is over the values, which in this case
+    /// is (key, value) pairs.
+    ///
+    /// | Iterable | Length          |
+    /// |----------|-----------------|
+    /// | yes      | sometimes known |
+    KeyValueIter(Box<dyn Iterator<Item = (Value, Value)> + Send + Sync>),
+
     /// Like `Iter` but supports efficient reversing.
     ///
     /// This means that the iterator has to be of type [`DoubleEndedIterator`].
@@ -555,6 +744,16 @@ pub enum Enumerator {
     /// |----------|-----------------|
     /// | yes      | sometimes known |
     RevIter(Box<dyn DoubleEndedIterator<Item = Value> + Send + Sync>),
+
+    /// Like `KeyValueIter` but supports efficient reversing.
+    ///
+    /// Similar to `KeyValueIter`, avoids an extra lookup while iterating over the
+    /// items of a mapping where both key and value are used.
+    ///
+    /// | Iterable | Length          |
+    /// |----------|-----------------|
+    /// | yes      | sometimes known |
+    RevKeyValueIter(Box<dyn DoubleEndedIterator<Item = (Value, Value)> + Send + Sync>),
 
     /// Indicates sequential iteration.
     ///
@@ -627,6 +826,8 @@ type_erase! {
         fn repr(&self) -> ObjectRepr;
 
         fn get_value(&self, key: &Value) -> Option<Value>;
+
+        fn get_value_by_str(&self, key: &str) -> Option<Value>;
 
         fn enumerate(&self) -> Enumerator;
 
@@ -701,7 +902,15 @@ impl Enumerator {
                 (a, Some(b)) if a == b => a,
                 _ => return None,
             },
+            Enumerator::KeyValueIter(i) => match i.size_hint() {
+                (a, Some(b)) if a == b => a,
+                _ => return None,
+            },
             Enumerator::RevIter(i) => match i.size_hint() {
+                (a, Some(b)) if a == b => a,
+                _ => return None,
+            },
+            Enumerator::RevKeyValueIter(i) => match i.size_hint() {
                 (a, Some(b)) if a == b => a,
                 _ => return None,
             },
@@ -781,8 +990,56 @@ macro_rules! impl_str_map_helper {
                 self.get(some!(key.as_str())).cloned().map(|v| v.into())
             }
 
+            #[inline(always)]
+            fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<Value> {
+                self.get(key).cloned().map(|v| v.into())
+            }
+
             fn enumerate(self: &Arc<Self>) -> Enumerator {
-                self.$enumerator(|this| Box::new(this.keys().map(|x| Value::from(x as &str))))
+                self.$enumerator(|this| {
+                    Box::new(
+                        this.iter()
+                            .map(|(k, v)| (Value::from(k as &str), v.clone().into())),
+                    )
+                })
+            }
+
+            fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
+                Some(self.len())
+            }
+        }
+    };
+}
+
+macro_rules! impl_static_str_map_helper {
+    ($map_type:ident, $enumerator:ident) => {
+        impl<V> Object for $map_type<&'static str, V>
+        where
+            V: Into<Value> + Clone + Send + Sync + fmt::Debug + 'static,
+        {
+            #[inline(always)]
+            fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+                self.get(some!(key.as_str())).cloned().map(|v| v.into())
+            }
+
+            #[inline(always)]
+            fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<Value> {
+                if self.len() <= 8 {
+                    self.iter().find_map(|(map_key, value)| {
+                        (*map_key == key).then(|| value.clone().into())
+                    })
+                } else {
+                    self.get(key).cloned().map(|v| v.into())
+                }
+            }
+
+            fn enumerate(self: &Arc<Self>) -> Enumerator {
+                self.$enumerator(|this| {
+                    Box::new(
+                        this.iter()
+                            .map(|(k, v)| (Value::from(*k), v.clone().into())),
+                    )
+                })
             }
 
             fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
@@ -796,6 +1053,7 @@ macro_rules! impl_str_map {
     ($map_type:ident, $enumerator:ident) => {
         impl_str_map_helper!($map_type, String, $enumerator);
         impl_str_map_helper!($map_type, Arc<str>, $enumerator);
+        impl_static_str_map_helper!($map_type, $enumerator);
 
         impl<V> From<$map_type<String, V>> for Value
         where
@@ -854,8 +1112,23 @@ macro_rules! impl_value_map {
                 self.get(key).cloned().map(|v| v.into())
             }
 
+            #[inline(always)]
+            fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<Value> {
+                if self.len() <= 12 {
+                    self.iter().find_map(|(k, v)| match &k.0 {
+                        ValueRepr::String(s, _) if &**s == key => Some(v.clone().into()),
+                        ValueRepr::SmallStr(s) if s.as_str() == key => Some(v.clone().into()),
+                        _ => None,
+                    })
+                } else {
+                    self.get(&Value::from(key)).cloned().map(|v| v.into())
+                }
+            }
+
             fn enumerate(self: &Arc<Self>) -> Enumerator {
-                self.$enumerator(|this| Box::new(this.keys().cloned()))
+                self.$enumerator(|this| {
+                    Box::new(this.iter().map(|(k, v)| (k.clone(), v.clone().into())))
+                })
             }
 
             fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
@@ -875,8 +1148,8 @@ macro_rules! impl_value_map {
 }
 
 impl_value_vec!(Vec);
-impl_value_map!(BTreeMap, mapped_rev_enumerator);
-impl_str_map!(BTreeMap, mapped_rev_enumerator);
+impl_value_map!(BTreeMap, mapped_rev_key_value_enumerator);
+impl_str_map!(BTreeMap, mapped_rev_key_value_enumerator);
 
 #[cfg(feature = "std_collections")]
 mod std_collections_impls {
@@ -886,8 +1159,8 @@ mod std_collections_impls {
     impl_value_iterable!(LinkedList, mapped_rev_enumerator);
     impl_value_iterable!(HashSet, mapped_enumerator);
     impl_value_iterable!(BTreeSet, mapped_rev_enumerator);
-    impl_str_map!(HashMap, mapped_enumerator);
-    impl_value_map!(HashMap, mapped_enumerator);
+    impl_str_map!(HashMap, mapped_key_value_enumerator);
+    impl_value_map!(HashMap, mapped_key_value_enumerator);
     impl_value_vec!(VecDeque);
 }
 
@@ -896,5 +1169,32 @@ mod preserve_order_impls {
     use super::*;
     use indexmap::IndexMap;
 
-    impl_value_map!(IndexMap, mapped_rev_enumerator);
+    impl_value_map!(IndexMap, mapped_rev_key_value_enumerator);
+}
+
+impl<T, const N: usize> Object for [T; N]
+where
+    T: Into<Value> + Clone + Send + Sync + fmt::Debug + 'static,
+{
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Seq
+    }
+
+    #[inline(always)]
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        self.get(some!(key.as_usize())).cloned().map(|v| v.into())
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        Enumerator::Seq(N)
+    }
+}
+
+impl<T, const N: usize> From<[T; N]> for Value
+where
+    T: Into<Value> + Clone + Send + Sync + fmt::Debug + 'static,
+{
+    fn from(value: [T; N]) -> Self {
+        Value::from_object(value)
+    }
 }

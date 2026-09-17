@@ -42,9 +42,16 @@ fn test_expression_owned() {
 }
 
 #[test]
-fn test_expression_bug() {
+fn test_trailing_garbage_rejected() {
     let env = Environment::new();
-    assert!(env.compile_expression("42.blahadsf()").is_err());
+    assert!(env.compile_expression("42 blahadsf").is_err());
+}
+
+#[test]
+fn test_int_method_call_compiles() {
+    let env = Environment::new();
+    let expr = env.compile_expression("42.blahadsf()").unwrap();
+    assert!(expr.eval(()).is_err());
 }
 
 #[test]
@@ -174,6 +181,11 @@ fn test_unknown_method_callback() {
     let rv = env.render_str("{{ {'x': 42}.items() }}", ()).unwrap();
     assert_snapshot!(rv, @r###"[["x", 42]]"###);
 
+    let rv = env
+        .render_str("{{ {'items': 'field', 'x': 42}.items() | length }}", ())
+        .unwrap();
+    assert_eq!(rv, "2");
+
     let err = env.render_str("{{ [].does_not_exist() }}", ()).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::UnknownMethod);
     assert_eq!(
@@ -198,4 +210,90 @@ fn test_iter() {
     assert_eq!(renders.len(), 2);
     assert!(renders.contains(&("hello", "Hello World!".into())));
     assert!(renders.contains(&("goodbye", "Goodbye World!".into())));
+}
+
+/// A string literal's backslashes taken literally, for an engine whose own
+/// templating does not unescape.
+///
+/// Measured on ansible-core 2.19.13, whose Jinja layer applies no escape
+/// processing to a literal at all:
+///
+/// ```text
+/// {{ '\n' | length }}   2        (Jinja2 and MiniJinja: 1)
+/// {{ '\1' | length }}   2        (Jinja2 and MiniJinja: 1)
+/// {{ '\w' | length }}   2        (an unknown escape: 2 everywhere)
+/// ```
+#[test]
+fn test_keep_string_escapes() {
+    let mut env = Environment::new();
+    env.set_keep_string_escapes(true);
+
+    for (template, expected) in [
+        (r"{{ '\n' | length }}", "2"),
+        (r"{{ '\1' | length }}", "2"),
+        (r"{{ '\b' | length }}", "2"),
+        (r"{{ '\w' | length }}", "2"),
+        (r"{{ '\\' | length }}", "2"),
+    ] {
+        assert_eq!(
+            env.render_str(template, ()).unwrap(),
+            expected,
+            "{template}"
+        );
+    }
+
+    // The literal is the bytes the template wrote, so a regular expression
+    // written inline reaches the filter intact.
+    assert_eq!(
+        env.render_str(r"{{ '\b(?!dev)(\w+)-' | length }}", ())
+            .unwrap(),
+        "15"
+    );
+}
+
+/// `compile_expression` compiles under the environment's configuration too.
+///
+/// It used to parse with `Default::default()` regardless, so an expression
+/// read `'\n'` as a newline while the same literal in a template read it as
+/// two characters. An embedder that renders a bare `{{ ... }}` through an
+/// expression rather than a template got the opposite answer from the one it
+/// asked for, silently.
+#[test]
+fn test_keep_string_escapes_applies_to_compiled_expressions() {
+    let mut env = Environment::new();
+    env.set_keep_string_escapes(true);
+
+    let expr = env
+        .compile_expression(r"'\b(?!dev)(\w+)-' | length")
+        .unwrap();
+    assert_eq!(expr.eval(()).unwrap().to_string(), "15");
+
+    let default = Environment::new();
+    let expr = default
+        .compile_expression(r"'\b(?!dev)(\w+)-' | length")
+        .unwrap();
+    assert_eq!(expr.eval(()).unwrap().to_string(), "14");
+}
+
+/// Off by default, so every existing template keeps Jinja2's behaviour.
+#[test]
+fn test_string_escapes_are_applied_by_default() {
+    let env = Environment::new();
+
+    assert_eq!(env.render_str(r"{{ '\n' | length }}", ()).unwrap(), "1");
+    assert_eq!(env.render_str(r"{{ '\1' | length }}", ()).unwrap(), "1");
+    assert_eq!(env.render_str(r"{{ '\w' | length }}", ()).unwrap(), "2");
+    assert!(!env.keep_string_escapes());
+}
+
+/// A literal with no backslash at all is unaffected either way, and quotes
+/// still terminate the literal rather than being swallowed.
+#[test]
+fn test_keep_string_escapes_leaves_ordinary_literals_alone() {
+    let mut env = Environment::new();
+    env.set_keep_string_escapes(true);
+
+    assert_eq!(env.render_str("{{ 'plain' }}", ()).unwrap(), "plain");
+    assert_eq!(env.render_str(r#"{{ "a'b" }}"#, ()).unwrap(), "a'b");
+    assert_eq!(env.render_str(r"{{ 'a\'b' | length }}", ()).unwrap(), "4");
 }

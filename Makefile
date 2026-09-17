@@ -18,11 +18,27 @@ test-msrv:
 	@$(MAKE) run-tests FEATURES=$(TEST_FEATURES),preserve_order,unicode
 	@echo "CARGO TEST ALL FEATURES"
 	@cd minijinja; cargo test --all-features
+	@$(MAKE) test-cabi
 
 .PHONY: test
-test: test-msrv test-cli
+test: test-msrv test-cli test-go
 	@echo "CARGO TEST MINIJINJA-CONTRIB ALL FEATURES"
 	@cd minijinja-contrib; cargo test --all-features
+
+.PHONY: test-rust
+test-rust: test-msrv test-cli
+	@echo "CARGO TEST MINIJINJA-CONTRIB ALL FEATURES"
+	@cd minijinja-contrib; cargo test --all-features
+
+.PHONY: test-go
+test-go:
+	@echo "GO TEST MINIJINJA-GO"
+	@cd minijinja-go; go test -v ./...
+
+.PHONY: test-cabi
+test-cabi:
+	@echo "C TESTS MINIJINJA-CABI"
+	@$(MAKE) -C minijinja-cabi test
 
 .PHONY: wasi-test
 wasi-test:

@@ -45,6 +45,11 @@ def test_expression():
     assert rv == list(range(10))
 
 
+def test_non_ascii_identifier():
+    env = Environment(templates={"t": "{{ ミニ神社 }}"})
+    assert env.render_template("t", **{"ミニ神社": "minijinja"}) == "minijinja"
+
+
 def test_pass_callable():
     def magic():
         return [1, 2, 3]
@@ -440,6 +445,15 @@ def test_pass_through_sort():
 
 
 def test_fucked_up_object():
+    # Seeded: the comparator is deliberately inconsistent, but Rust's sort only
+    # raises when it *notices*, and on an unseeded draw it sometimes does not.
+    # Measured on this tree, the test failed 1 run in 40 that way -- the same
+    # commit going red in one CI run and green in another. The sort's call
+    # sequence is deterministic for a fixed length, so seeding fixes the whole
+    # system: 0 misses in 240 runs across four seeds, where "always True" and
+    # "always False" are never detected at all.
+    random.seed(0)
+
     @total_ordering
     class X:
         __lt__ = __eq__ = lambda s, o: random.random() > 0.5
@@ -526,6 +540,14 @@ def test_striptags():
     env = Environment()
     assert env.eval_expr("'<a>foo</a>'|striptags") == "foo"
     assert env.eval_expr("'<a>&auml;</a>'|striptags") == "ä"
+
+
+def test_wordwrap():
+    env = Environment()
+    assert (
+        env.eval_expr("text|wordwrap(width=20)", text="the quick brown fox jumps")
+        == "the quick brown fox\njumps"
+    )
 
 
 def test_attribute_lookups():

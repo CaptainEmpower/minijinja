@@ -34,7 +34,10 @@ fn main() {
 
     // keep running the template.  to experiment change the template.txt file or
     // rename or change the include file.
-    for iteration in 1.. {
+    // Bounded rather than `1..`: an unbounded range wraps, and
+    // `clippy::for_unbounded_range` is denied. The demo is meant to run until
+    // interrupted, and at one iteration a second the bound is not reachable.
+    for iteration in 1..=u64::MAX {
         // acquire gets the latest version of the environment.
         let env = reloader.acquire_env().unwrap();
         let tmpl = env.get_template("template.txt").unwrap();

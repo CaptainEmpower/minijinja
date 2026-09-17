@@ -3,3 +3,10 @@ target
 profile.json
 **/snapshots/*.new
 **/*.pending-snap
+.ai-ack
+.pi/git
+.pi/npm
+.pi/todos
+
+# Go
+minijinja-go/vendor/

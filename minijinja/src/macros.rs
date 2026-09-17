@@ -23,23 +23,27 @@ macro_rules! some {
 /// Hidden utility module for the [`context!`](crate::context!) macro.
 #[doc(hidden)]
 pub mod __context {
-    use crate::value::{Value, ValueMap};
+    use crate::value::{StaticKeyMap, Value};
     use crate::Environment;
     use std::rc::Rc;
 
     #[inline(always)]
-    pub fn make() -> ValueMap {
-        ValueMap::default()
+    pub fn make() -> Vec<(&'static str, Value)> {
+        Vec::new()
     }
 
     #[inline(always)]
-    pub fn add(ctx: &mut ValueMap, key: &'static str, value: Value) {
-        ctx.insert(key.into(), value);
+    pub fn add(ctx: &mut Vec<(&'static str, Value)>, key: &'static str, value: Value) {
+        if let Some((_, old_value)) = ctx.iter_mut().find(|(map_key, _)| *map_key == key) {
+            *old_value = value;
+        } else {
+            ctx.push((key, value));
+        }
     }
 
     #[inline(always)]
-    pub fn build(ctx: ValueMap) -> Value {
-        Value::from_object(ctx)
+    pub fn build(ctx: Vec<(&'static str, Value)>) -> Value {
+        Value::from_object(StaticKeyMap(ctx))
     }
 
     pub fn thread_local_env() -> Rc<Environment<'static>> {
@@ -166,6 +170,15 @@ macro_rules! __context_pair {
     ($ctx:ident, $key:ident) => {{
         $crate::__context_pair!($ctx, $key => $key);
     }};
+    ($ctx:ident, $key:ident => $value:literal) => {
+        $crate::__context::add(&mut $ctx, stringify!($key), $crate::value::Value::from($value));
+    };
+    ($ctx:ident, $key:ident => context! { $($inner:tt)* }) => {
+        $crate::__context::add(&mut $ctx, stringify!($key), $crate::context! { $($inner)* });
+    };
+    ($ctx:ident, $key:ident => context!($($inner:tt)*)) => {
+        $crate::__context::add(&mut $ctx, stringify!($key), $crate::context!($($inner)*));
+    };
     ($ctx:ident, $key:ident => $value:expr) => {
         $crate::__context::add(
             &mut $ctx,

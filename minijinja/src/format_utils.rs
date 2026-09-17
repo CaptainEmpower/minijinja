@@ -22,6 +22,12 @@ pub enum FormatStyle {
     StrFormat,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FormatConversion {
+    Other,
+    Character,
+}
+
 /// A helper function to apply a set of values to a given format string.
 ///
 /// The function supports two styles of formatting as described by the
@@ -37,6 +43,14 @@ pub fn format_filter(
         FormatStyle::Printf => printf_style::format(format_str, args),
         FormatStyle::StrFormat => str_format_style::format(format_str, args),
     }
+}
+
+pub(crate) fn format_printf_with(
+    format_str: &str,
+    args: &[Value],
+    transform: impl Fn(&Value, FormatConversion) -> Result<Option<Value>, Error>,
+) -> Result<String, Error> {
+    printf_style::format_with(format_str, args, &transform)
 }
 
 // Token produced by the format string parser
@@ -95,6 +109,7 @@ enum Type {
     UpperF,
     LowerG,
     UpperG,
+    Char,
     String,
 }
 
@@ -113,6 +128,7 @@ impl Type {
             Type::UpperF => "fixed-point notation ('F')",
             Type::LowerG => "general format ('g')",
             Type::UpperG => "general format ('G')",
+            Type::Char => "character format ('c')",
             Type::String => "string format ('s')",
         }
     }
@@ -193,12 +209,16 @@ impl FormatSpec {
 
         match self.ty {
             Type::Default if !treat_as_integer => {
-                // Format "true" or "false" as a regular string, ignoring the
+                // Format "True" or "False" as a regular string, ignoring the
                 // precision (i.e. without truncating)
-                Ok(self.apply_padding(format!("{val}"), Align::Left))
+                let text = if val { "True" } else { "False" };
+                Ok(self.apply_padding(text.to_owned(), Align::Left))
             }
             Type::String => match self.format_style {
-                FormatStyle::Printf => Ok(self.apply_padding(format!("{val}"), Align::Right)),
+                FormatStyle::Printf => {
+                    let text = if val { "True" } else { "False" };
+                    Ok(self.apply_padding(text.to_owned(), Align::Right))
+                }
                 FormatStyle::StrFormat => Err(self.type_conversion_err("bool", Type::String)),
             },
             Type::Default
@@ -212,7 +232,8 @@ impl FormatSpec {
             | Type::LowerF
             | Type::UpperF
             | Type::LowerG
-            | Type::UpperG => self.format_integer(if val { 1 } else { 0 }, false),
+            | Type::UpperG
+            | Type::Char => self.format_integer(if val { 1 } else { 0 }, false),
         }
     }
 
@@ -224,13 +245,27 @@ impl FormatSpec {
                     FormatStyle::StrFormat => Align::Left,
                 };
 
-                if let Some(p) = &self.precision {
-                    if *p < text.len() {
-                        return Ok(self.apply_padding(text[..*p].to_string(), default_align));
+                if let Some(p) = self.precision {
+                    if let Some((offset, _)) = text.char_indices().nth(p) {
+                        return Ok(self.apply_padding(text[..offset].to_string(), default_align));
                     }
                 }
                 Ok(self.apply_padding(text, default_align))
             }
+            Type::Char => match self.format_style {
+                // this is to keep consitency with errors in corresponding python functions used by jinja2
+                FormatStyle::StrFormat => Err(self.type_conversion_err("string", self.ty)),
+                FormatStyle::Printf => {
+                    let mut chars = text.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) => Ok(self.format_char(c)),
+                        _ => Err(Error::new(
+                            ErrorKind::InvalidOperation,
+                            format!("{} requires integer or char", self.ty.description()),
+                        )),
+                    }
+                }
+            },
             Type::Binary
             | Type::Decimal
             | Type::Octal
@@ -386,6 +421,56 @@ impl FormatSpec {
             Type::LowerHex => ok!(self.group_binary_num(format!("{val:x}"))),
             Type::UpperHex => ok!(self.group_binary_num(format!("{val:X}"))),
             Type::Default | Type::Decimal => self.group_decimal_num(format!("{val}")),
+            Type::Char => {
+                if is_negative {
+                    return Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!("{} arg not in range(0x110000)", self.ty.description()),
+                    ));
+                }
+                if self.format_style == FormatStyle::StrFormat {
+                    if self.print_sign || self.space_before_positive_num {
+                        return Err(Error::new(
+                            ErrorKind::InvalidOperation,
+                            format!("sign flags are not allowed with {}", self.ty.description()),
+                        ));
+                    }
+                    if self.alternate_form {
+                        return Err(Error::new(
+                            ErrorKind::InvalidOperation,
+                            format!(
+                                "invalid format spec at offset {}; '#' cannot be specified with {}",
+                                self.location,
+                                self.ty.description()
+                            ),
+                        ));
+                    }
+                    if let Some(sep) = self.integer_grouping {
+                        return Err(Error::new(
+                            ErrorKind::InvalidOperation,
+                            format!(
+                                "invalid format spec at offset {}; '{}' cannot be specified with {}",
+                                self.location,
+                                match sep {
+                                    Separator::Comma => ',',
+                                    Separator::Underscore => '_',
+                                },
+                                self.ty.description()
+                            ),
+                        ));
+                    }
+                }
+                let c = u32::try_from(val)
+                    .ok()
+                    .and_then(std::char::from_u32)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::InvalidOperation,
+                            format!("{} arg not in range(0x110000)", self.ty.description()),
+                        )
+                    })?;
+                return Ok(self.format_char(c));
+            }
             Type::String => {
                 if let FormatStyle::Printf = self.format_style {
                     // printf-style formatting in Python ignores sign character flag
@@ -523,9 +608,12 @@ impl FormatSpec {
                     Ok(self.format_number(&num, sign))
                 }
             },
-            Type::Binary | Type::Octal | Type::LowerHex | Type::UpperHex | Type::Decimal => {
-                Err(self.type_conversion_err("float", self.ty))
-            }
+            Type::Binary
+            | Type::Octal
+            | Type::LowerHex
+            | Type::UpperHex
+            | Type::Decimal
+            | Type::Char => Err(self.type_conversion_err("float", self.ty)),
         }
     }
 
@@ -619,8 +707,40 @@ impl FormatSpec {
         }
     }
 
-    fn apply_padding(&self, text: String, default_align: Align) -> String {
-        let curr_width = text.len();
+    fn format_char(&self, c: char) -> String {
+        match self.format_style {
+            FormatStyle::Printf => {
+                let align = self
+                    .fill_align
+                    .as_ref()
+                    .map(|fa| fa.align)
+                    .unwrap_or(Align::Right);
+                self.apply_padding_with_width(c.to_string(), align, 1)
+            }
+            FormatStyle::StrFormat => {
+                if let Some(fa) = &self.fill_align {
+                    self.apply_padding_with_width(c.to_string(), fa.align, 1)
+                } else if self.zero_padded {
+                    if let Some(min_width) = self.width {
+                        if 1 < min_width {
+                            let fill_width = min_width - 1;
+                            return format!("{}{c}", "0".repeat(fill_width));
+                        }
+                    }
+                    c.to_string()
+                } else {
+                    self.apply_padding_with_width(c.to_string(), Align::Right, 1)
+                }
+            }
+        }
+    }
+
+    fn apply_padding_with_width(
+        &self,
+        text: String,
+        default_align: Align,
+        curr_width: usize,
+    ) -> String {
         if let Some(min_width) = &self.width {
             if curr_width < *min_width {
                 let fill_width = min_width - curr_width;
@@ -654,6 +774,11 @@ impl FormatSpec {
             }
         }
         text
+    }
+
+    fn apply_padding(&self, text: String, default_align: Align) -> String {
+        let curr_width = text.len();
+        self.apply_padding_with_width(text, default_align, curr_width)
     }
 }
 
@@ -843,6 +968,7 @@ fn parse_type(cursor: &mut Cursor, style: FormatStyle) -> Result<Type, Error> {
         Some(b'o') => Type::Octal,
         Some(b'x') => Type::LowerHex,
         Some(b'X') => Type::UpperHex,
+        Some(b'c') => Type::Char,
         Some(b's') => Type::String,
         Some(b'}') if FormatStyle::StrFormat == style => {
             // end of spec, return without consuming '}'
@@ -909,7 +1035,7 @@ mod printf_style {
     // precision -> number | '*'
     // number -> [0-9]+
     // len_modifier -> 'h' | 'l' | 'L'
-    // type -> 'd' | 'i' | 'o' | 'x' | 'X' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 's'
+    // type -> 'd' | 'i' | 'o' | 'x' | 'X' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'c' | 's'
     pub(super) fn replacement_field<'s>(
         cursor: &mut Cursor<'s>,
     ) -> Result<ReplacementField<'s>, Error> {
@@ -1017,6 +1143,14 @@ mod printf_style {
     // to the fields found in the string, by formatting the value according to the
     // spec found in the field.
     pub(super) fn format(format_str: &str, args: &[Value]) -> Result<String, Error> {
+        format_with(format_str, args, &|_, _| Ok(None))
+    }
+
+    pub(super) fn format_with(
+        format_str: &str,
+        args: &[Value],
+        transform: &impl Fn(&Value, FormatConversion) -> Result<Option<Value>, Error>,
+    ) -> Result<String, Error> {
         let mut input = Tokenizer::new(format_str, FormatStyle::Printf);
         let mut result = String::new();
         let mut arg_index = 0;
@@ -1065,7 +1199,15 @@ mod printf_style {
                             return Err(missing_arg_err(format_spec.location));
                         }
                     };
-                    result.push_str(&ok!(format_spec.format(&arg)));
+                    let conversion = if format_spec.ty == Type::Char {
+                        FormatConversion::Character
+                    } else {
+                        FormatConversion::Other
+                    };
+                    let transformed = ok!(transform(&arg, conversion));
+                    result.push_str(&ok!(
+                        format_spec.format(transformed.as_ref().unwrap_or(&arg))
+                    ));
                 }
             }
         }
@@ -1096,7 +1238,7 @@ mod str_format_style {
     // width -> number
     // precision -> number
     // number -> [0-9]+
-    // type -> 'b' | 'd' | 'o' | 'x' | 'X' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 's'
+    // type -> 'b' | 'd' | 'o' | 'x' | 'X' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'c' | 's'
     pub(super) fn replacement_field<'s>(
         cursor: &mut Cursor<'s>,
     ) -> Result<ReplacementField<'s>, Error> {
@@ -1204,14 +1346,15 @@ mod str_format_style {
         let location = cursor.position();
         let mut print_sign = false;
         let mut space_before_positive_num = false;
+        let mut minus_sign = false;
         let fill_align = parse_fill_align(cursor);
 
         if cursor.advance_if(b'+') {
             print_sign = true;
         } else if cursor.advance_if(b' ') {
             space_before_positive_num = true;
-        } else {
-            cursor.advance_if(b'-');
+        } else if cursor.advance_if(b'-') {
+            minus_sign = true;
         }
 
         let alternate_form = cursor.advance_if(b'#');
@@ -1240,6 +1383,45 @@ mod str_format_style {
             .flatten();
 
         let ty = ok!(parse_type(cursor, FormatStyle::StrFormat));
+
+        if ty == Type::Char {
+            if print_sign || space_before_positive_num || minus_sign {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!(
+                        "invalid format spec at offset {}; sign flags are not allowed with {}",
+                        location,
+                        ty.description()
+                    ),
+                ));
+            }
+            if alternate_form {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!(
+                        "invalid format spec at offset {}; '#' cannot be specified with {}",
+                        location,
+                        ty.description()
+                    ),
+                ));
+            }
+            if let Some(grouping) = integer_grouping {
+                let sep = match grouping {
+                    Separator::Comma => ',',
+                    Separator::Underscore => '_',
+                };
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!(
+                        "invalid format spec at offset {}; '{}' cannot be specified with {}",
+                        location,
+                        sep,
+                        ty.description()
+                    ),
+                ));
+            }
+        }
+
         Ok(FormatSpec {
             fill_align,
             print_sign,

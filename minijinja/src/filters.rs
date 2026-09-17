@@ -45,6 +45,11 @@
 //! MiniJinja will perform the necessary conversions automatically.  For more
 //! information see the [`Function`](crate::functions::Function) trait.
 //!
+//! Filters which transform strings and need to preserve the input's escaping
+//! safety can use [`StringInput`](crate::value::StringInput) as their argument
+//! type.  It retains the safety provenance that conversion to [`String`] would
+//! otherwise discard.
+//!
 //! # Accessing State
 //!
 //! In some cases it can be necessary to access the execution [`State`].  Since a borrowed
@@ -157,7 +162,18 @@ pub fn escape(state: &State, v: &Value) -> Result<Value, Error> {
         None => String::new(),
     };
     let mut out = Output::new(&mut rv);
-    ok!(write_escaped(&mut out, auto_escape, v));
+    if matches!(auto_escape, AutoEscape::Custom(_)) {
+        // The formatter reads the escape mode from state, so temporarily
+        // override it to ensure |e honors the computed escape mode even when
+        // auto-escape is disabled in the current scope. The default formatter
+        // also errors on custom auto-escape formats, so we must route through
+        // the environment formatter here.
+        ok!(state.with_auto_escape(auto_escape, |state| {
+            state.env().format(v, state, &mut out)
+        }));
+    } else {
+        ok!(write_escaped(&mut out, auto_escape, v));
+    }
     Ok(Value::from_safe_string(rv))
 }
 
@@ -166,11 +182,13 @@ mod builtins {
     use super::*;
 
     use crate::error::ErrorKind;
-    use crate::format_utils::{format_filter, FormatStyle};
+    use crate::format_utils::{format_filter, format_printf_with, FormatConversion, FormatStyle};
     use crate::utils::{safe_sort, splitn_whitespace};
     use crate::value::merge_object::{MergeDict, MergeSeq};
     use crate::value::ops::{self, as_f64, LenIterWrap};
-    use crate::value::{Enumerator, Kwargs, Object, ObjectRepr, Rest, ValueKind, ValueRepr};
+    use crate::value::{
+        Enumerator, Kwargs, Object, ObjectRepr, Rest, StringInput, ValueKind, ValueRepr,
+    };
     use std::borrow::Cow;
     use std::cmp::Ordering;
     use std::fmt::Write;
@@ -183,8 +201,9 @@ mod builtins {
     /// <h1>{{ chapter.title|upper }}</h1>
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn upper(v: Cow<'_, str>) -> String {
-        v.to_uppercase()
+    pub fn upper(value: StringInput<'_>) -> Value {
+        let output = value.as_str().to_uppercase();
+        value.preserve_safety(output)
     }
 
     /// Converts a value to lowercase.
@@ -193,8 +212,9 @@ mod builtins {
     /// <h1>{{ chapter.title|lower }}</h1>
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn lower(v: Cow<'_, str>) -> String {
-        v.to_lowercase()
+    pub fn lower(value: StringInput<'_>) -> Value {
+        let output = value.as_str().to_lowercase();
+        value.preserve_safety(output)
     }
 
     /// Converts a value to title case.
@@ -227,12 +247,15 @@ mod builtins {
     /// <h1>{{ chapter.title|capitalize }}</h1>
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn capitalize(text: Cow<'_, str>) -> String {
-        let mut chars = text.chars();
-        match chars.next() {
+    pub fn capitalize(value: StringInput<'_>) -> Value {
+        let mut chars = value.as_str().chars();
+        let output = match chars.next() {
             None => String::new(),
-            Some(f) => f.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
-        }
+            Some(first) => {
+                first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+            }
+        };
+        value.preserve_safety(output)
     }
 
     /// Does a string replace.
@@ -245,12 +268,24 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn replace(
-        _state: &State,
-        v: Cow<'_, str>,
-        from: Cow<'_, str>,
-        to: Cow<'_, str>,
-    ) -> String {
-        v.replace(&from as &str, &to as &str)
+        state: &State,
+        value: StringInput<'_>,
+        from: StringInput<'_>,
+        to: StringInput<'_>,
+    ) -> Result<Value, Error> {
+        let safety_aware = !matches!(state.auto_escape(), AutoEscape::None)
+            && (value.is_safe() || from.is_safe() || to.is_safe());
+
+        if safety_aware {
+            let output = value
+                .format(state)?
+                .replace(from.as_str(), &to.format(state)?);
+            Ok(Value::from_safe_string(output))
+        } else {
+            Ok(Value::from(
+                value.as_str().replace(from.as_str(), to.as_str()),
+            ))
+        }
     }
 
     /// Returns the "length" of the value
@@ -270,20 +305,29 @@ mod builtins {
         })
     }
 
-    fn cmp_helper(a: &Value, b: &Value, case_sensitive: bool) -> Ordering {
-        if !case_sensitive {
+    fn cmp_helper(a: &Value, b: &Value, case_sensitive: bool, reverse: bool) -> Ordering {
+        let ordering = if !case_sensitive {
             if let (Some(a), Some(b)) = (a.as_str(), b.as_str()) {
                 #[cfg(feature = "unicode")]
                 {
-                    return unicase::UniCase::new(a).cmp(&unicase::UniCase::new(b));
+                    unicase::UniCase::new(a).cmp(&unicase::UniCase::new(b))
                 }
                 #[cfg(not(feature = "unicode"))]
                 {
-                    return a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase());
+                    a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
                 }
+            } else {
+                a.cmp(b)
             }
+        } else {
+            a.cmp(b)
+        };
+
+        if reverse {
+            ordering.reverse()
+        } else {
+            ordering
         }
-        a.cmp(b)
     }
 
     /// Dict sorting functionality.
@@ -306,21 +350,20 @@ mod builtins {
 
         let by_value = matches!(ok!(kwargs.get("by")), Some("value"));
         let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive")).unwrap_or(false);
-        let mut rv: Vec<_> = ok!(v.try_iter())
-            .map(|key| (key.clone(), v.get_item(&key).unwrap_or(Value::UNDEFINED)))
-            .collect();
+        let reverse = ok!(kwargs.get::<Option<bool>>("reverse")).unwrap_or(false);
+        let mut rv: Vec<_> = if let Some(iter) = v.as_object().and_then(|v| v.try_iter_pairs()) {
+            iter.collect()
+        } else {
+            ok!(v.try_iter())
+                .map(|key| (key.clone(), v.get_item(&key).unwrap_or(Value::UNDEFINED)))
+                .collect()
+        };
         safe_sort(&mut rv, |a, b| {
             let (a, b) = if by_value { (&a.1, &b.1) } else { (&a.0, &b.0) };
-            cmp_helper(a, b, case_sensitive)
+            cmp_helper(a, b, case_sensitive, reverse)
         })?;
-        if let Some(true) = ok!(kwargs.get("reverse")) {
-            rv.reverse();
-        }
         kwargs.assert_all_used()?;
-        Ok(rv
-            .into_iter()
-            .map(|(k, v)| Value::from(vec![k, v]))
-            .collect())
+        Ok(rv.into_iter().map(|(k, v)| Value::from([k, v])).collect())
     }
 
     /// Returns an iterable of pairs (items) from a mapping.
@@ -345,7 +388,7 @@ mod builtins {
         if v.kind() == ValueKind::Map {
             Ok(Value::make_object_iterable(v.clone(), |v| {
                 match v.as_object().and_then(|v| v.try_iter_pairs()) {
-                    Some(iter) => Box::new(iter.map(|(key, value)| Value::from(vec![key, value]))),
+                    Some(iter) => Box::new(iter.map(|(key, value)| Value::from([key, value]))),
                     None => Box::new(
                         // this really should not happen unless the object changes it's shape
                         // after the initial check
@@ -373,8 +416,18 @@ mod builtins {
     /// {% endfor %}
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn reverse(v: &Value) -> Result<Value, Error> {
-        v.reverse()
+    pub fn reverse(value: &Value) -> Result<Value, Error> {
+        if value.kind() == ValueKind::String {
+            let string = value.as_str().unwrap();
+            let output = string.chars().rev().collect::<String>();
+            if value.is_safe() {
+                Ok(Value::from_safe_string(output))
+            } else {
+                Ok(Value::from(output))
+            }
+        } else {
+            value.reverse()
+        }
     }
 
     /// Trims a string.
@@ -392,14 +445,15 @@ mod builtins {
     /// {{ "1212foo12bar1212" | trim("12") }} -> "foo12bar"
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn trim(s: Cow<'_, str>, chars: Option<Cow<'_, str>>) -> String {
-        match chars {
+    pub fn trim(value: StringInput<'_>, chars: Option<Cow<'_, str>>) -> Value {
+        let output = match chars {
             Some(chars) => {
                 let chars = chars.chars().collect::<Vec<_>>();
-                s.trim_matches(&chars[..]).to_string()
+                value.as_str().trim_matches(&chars[..]).to_string()
             }
-            None => s.trim().to_string(),
-        }
+            None => value.as_str().trim().to_string(),
+        };
+        value.preserve_safety(output)
     }
 
     /// Joins a sequence by a character
@@ -408,32 +462,80 @@ mod builtins {
     /// {{ "Foo Bar Baz" | join(", ") }} -> foo, bar, baz
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn join(val: &Value, joiner: Option<Cow<'_, str>>) -> Result<String, Error> {
-        if val.is_undefined() || val.is_none() {
-            return Ok(String::new());
+    pub fn join(
+        state: &State,
+        value: &Value,
+        joiner: Option<StringInput<'_>>,
+    ) -> Result<Value, Error> {
+        fn join_plain(iter: impl Iterator<Item = Value>, joiner: &str) -> String {
+            let mut output = String::new();
+            for (idx, item) in iter.enumerate() {
+                if idx > 0 {
+                    output.push_str(joiner);
+                }
+                if let Some(string) = item.as_str() {
+                    output.push_str(string);
+                } else {
+                    write!(output, "{item}").ok();
+                }
+            }
+            output
         }
 
-        let joiner = joiner.as_ref().unwrap_or(&Cow::Borrowed(""));
-        let iter = ok!(val.try_iter().map_err(|err| {
+        fn join_safe(
+            state: &State,
+            iter: impl Iterator<Item = Value>,
+            joiner: &str,
+        ) -> Result<String, Error> {
+            let mut output = String::new();
+            for (idx, item) in iter.enumerate() {
+                if idx > 0 {
+                    output.push_str(joiner);
+                }
+                if item.is_safe() {
+                    output.push_str(item.as_str().unwrap());
+                } else {
+                    output.push_str(&ok!(state.format(item)));
+                }
+            }
+            Ok(output)
+        }
+
+        let joiner_str = joiner.as_ref().map(StringInput::as_str).unwrap_or_default();
+        let iter = ok!(value.try_iter().map_err(|err| {
             Error::new(
                 ErrorKind::InvalidOperation,
-                format!("cannot join value of type {}", val.kind()),
+                format!("cannot join value of type {}", value.kind()),
             )
             .with_source(err)
         }));
 
-        let mut rv = String::new();
-        for (idx, item) in iter.enumerate() {
-            if idx > 0 {
-                rv.push_str(joiner);
-            }
-            if let Some(s) = item.as_str() {
-                rv.push_str(s);
-            } else {
-                write!(rv, "{item}").ok();
-            }
+        if matches!(state.auto_escape(), AutoEscape::None) {
+            return Ok(Value::from(join_plain(iter, joiner_str)));
         }
-        Ok(rv)
+
+        if joiner.as_ref().is_some_and(StringInput::is_safe) {
+            return Ok(Value::from_safe_string(ok!(join_safe(
+                state, iter, joiner_str
+            ))));
+        }
+
+        // A plain joiner only becomes safe if at least one item is safe.  This
+        // is the one case where the iterable must be inspected before output.
+        let items = iter.collect::<Vec<_>>();
+        if items.iter().any(Value::is_safe) {
+            let joiner = match joiner.as_ref() {
+                Some(joiner) => ok!(joiner.format(state)),
+                None => Cow::Borrowed(""),
+            };
+            Ok(Value::from_safe_string(ok!(join_safe(
+                state,
+                items.into_iter(),
+                &joiner
+            ))))
+        } else {
+            Ok(Value::from(join_plain(items.into_iter(), joiner_str)))
+        }
     }
 
     /// Split a string into its substrings, using `split` as the separator string.
@@ -447,21 +549,36 @@ mod builtins {
     /// rather than Rust ones so `1` means one split and two resulting items.
     ///
     /// ```jinja
-    /// {{ "hello world"|split|list }}
+    /// {{ "hello world"|split }}
     ///     -> ["hello", "world"]
     ///
-    /// {{ "c,s,v"|split(",")|list }}
+    /// {{ "c,s,v"|split(",") }}
     ///     -> ["c", "s", "v"]
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn split(s: Arc<str>, split: Option<Arc<str>>, maxsplits: Option<i64>) -> Value {
+    pub fn split(
+        value: &Value,
+        split: Option<Arc<str>>,
+        maxsplits: Option<i64>,
+    ) -> Result<Value, Error> {
+        let string = Arc::<str>::try_from(value.clone())?;
         let maxsplits = maxsplits.and_then(|x| if x >= 0 { Some(x as usize + 1) } else { None });
+        let preserve_safety = value.kind() == ValueKind::String && value.is_safe();
+        let wrap = |item: &str| {
+            if preserve_safety {
+                Value::from_safe_string(item.to_string())
+            } else {
+                Value::from(item)
+            }
+        };
 
-        Value::make_object_iterable((s, split), move |(s, split)| match (split, maxsplits) {
-            (None, None) => Box::new(s.split_whitespace().map(Value::from)),
-            (Some(split), None) => Box::new(s.split(split as &str).map(Value::from)),
-            (None, Some(n)) => Box::new(splitn_whitespace(s, n).map(Value::from)),
-            (Some(split), Some(n)) => Box::new(s.splitn(n, split as &str).map(Value::from)),
+        // Materialize into a sequence (like `lines`) so negative indexing and
+        // slicing work, e.g. `("1.2.3"|split("."))[-1]`.
+        Ok(match (split, maxsplits) {
+            (None, None) => Value::from_iter(string.split_whitespace().map(wrap)),
+            (Some(sep), None) => Value::from_iter(string.split(sep.as_ref()).map(wrap)),
+            (None, Some(n)) => Value::from_iter(splitn_whitespace(&string, n).map(wrap)),
+            (Some(sep), Some(n)) => Value::from_iter(string.splitn(n, sep.as_ref()).map(wrap)),
         })
     }
 
@@ -475,8 +592,16 @@ mod builtins {
     ///     -> ["foo", "bar", "baz"]
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn lines(s: Arc<str>) -> Value {
-        Value::from_iter(s.lines().map(|x| x.to_string()))
+    pub fn lines(value: &Value) -> Result<Value, Error> {
+        let string = Arc::<str>::try_from(value.clone())?;
+        let preserve_safety = value.kind() == ValueKind::String && value.is_safe();
+        Ok(Value::from_iter(string.lines().map(|line| {
+            if preserve_safety {
+                Value::from_safe_string(line.to_string())
+            } else {
+                Value::from(line)
+            }
+        })))
     }
 
     /// If the value is undefined it will return the passed default value,
@@ -493,13 +618,22 @@ mod builtins {
     /// <p>{{ ""|default("string was empty", true) }}</p>
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn default(value: &Value, other: Option<Value>, lax: Option<bool>) -> Value {
-        if value.is_undefined() {
-            other.unwrap_or_else(|| Value::from(""))
-        } else if lax.unwrap_or(false) && !value.is_true() {
-            other.unwrap_or_else(|| Value::from(""))
+    pub fn default(state: &State, value: &Value, args: Rest<Value>) -> Result<Value, Error> {
+        if args.len() > 2 {
+            return Err(Error::from(ErrorKind::TooManyArguments));
+        }
+
+        let other = args.first().cloned().unwrap_or_else(|| Value::from(""));
+        let lax = if let Some(lax) = args.get(1) {
+            ok!(state.undefined_behavior().is_true(lax))
         } else {
-            value.clone()
+            false
+        };
+
+        if value.is_undefined() || (lax && !value.is_true()) {
+            Ok(other)
+        } else {
+            Ok(value.clone())
         }
     }
 
@@ -536,9 +670,12 @@ mod builtins {
     /// {{ "42"|int == 42 }} -> true
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn int(value: &Value) -> Result<Value, Error> {
+    pub fn int(state: &State, value: &Value) -> Result<Value, Error> {
         match &value.0 {
-            ValueRepr::Undefined(_) | ValueRepr::None => Ok(Value::from(0)),
+            ValueRepr::Undefined(_) | ValueRepr::None => {
+                ok!(state.undefined_behavior().assert_value_not_undefined(value));
+                Ok(Value::from(0))
+            }
             ValueRepr::Bool(x) => Ok(Value::from(*x as u64)),
             ValueRepr::U64(_) | ValueRepr::I64(_) | ValueRepr::U128(_) | ValueRepr::I128(_) => {
                 Ok(value.clone())
@@ -569,9 +706,12 @@ mod builtins {
     /// {{ "42.5"|float == 42.5 }} -> true
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn float(value: &Value) -> Result<Value, Error> {
+    pub fn float(state: &State, value: &Value) -> Result<Value, Error> {
         match &value.0 {
-            ValueRepr::Undefined(_) | ValueRepr::None => Ok(Value::from(0.0)),
+            ValueRepr::Undefined(_) | ValueRepr::None => {
+                ok!(state.undefined_behavior().assert_value_not_undefined(value));
+                Ok(Value::from(0.0))
+            }
             ValueRepr::Bool(x) => Ok(Value::from(*x as u64 as f64)),
             ValueRepr::String(..) | ValueRepr::SmallStr(_) => value
                 .as_str()
@@ -695,8 +835,14 @@ mod builtins {
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
     pub fn last(value: Value) -> Result<Value, Error> {
-        if let Some(s) = value.as_str() {
-            Ok(s.chars().next_back().map_or(Value::UNDEFINED, Value::from))
+        if let Some(string) = value.as_str() {
+            Ok(string.chars().next_back().map_or(Value::UNDEFINED, |ch| {
+                if value.is_safe() {
+                    Value::from_safe_string(ch.to_string())
+                } else {
+                    Value::from(ch)
+                }
+            }))
         } else if matches!(value.kind(), ValueKind::Seq | ValueKind::Iterable) {
             let rev = ok!(value.reverse());
             let mut iter = ok!(rev.try_iter());
@@ -762,6 +908,7 @@ mod builtins {
         .collect::<Vec<_>>();
 
         let case_sensitive = ok!(kwargs.get::<Option<bool>>("case_sensitive")).unwrap_or(false);
+        let reverse = ok!(kwargs.get::<Option<bool>>("reverse")).unwrap_or(false);
 
         if let Some(attr) = ok!(kwargs.get::<Option<&str>>("attribute")) {
             let keys: Vec<_> = attr
@@ -787,23 +934,20 @@ mod builtins {
                         keys.iter()
                             .map(|k| b.get_path_or_default(k, &Value::UNDEFINED)),
                     );
-                    cmp_helper(&key_a, &key_b, case_sensitive)
+                    cmp_helper(&key_a, &key_b, case_sensitive, reverse)
                 })?;
             } else {
                 // Fast path for a more common case of single key
                 let key = if !keys.is_empty() { keys[0] } else { attr };
                 safe_sort(&mut items, |a, b| {
                     match (a.get_path(key), b.get_path(key)) {
-                        (Ok(a), Ok(b)) => cmp_helper(&a, &b, case_sensitive),
+                        (Ok(a), Ok(b)) => cmp_helper(&a, &b, case_sensitive, reverse),
                         _ => Ordering::Equal,
                     }
                 })?;
             }
         } else {
-            safe_sort(&mut items, |a, b| cmp_helper(a, b, case_sensitive))?;
-        }
-        if let Some(true) = ok!(kwargs.get("reverse")) {
-            items.reverse();
+            safe_sort(&mut items, |a, b| cmp_helper(a, b, case_sensitive, reverse))?;
         }
         ok!(kwargs.assert_all_used());
         Ok(Value::from(items))
@@ -827,12 +971,13 @@ mod builtins {
     ///
     /// If the string has been marked as safe, that value is preserved.
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn string(value: &Value) -> Value {
-        if value.kind() == ValueKind::String {
+    pub fn string(state: &State, value: &Value) -> Result<Value, Error> {
+        ok!(state.undefined_behavior().assert_value_not_undefined(value));
+        Ok(if value.kind() == ValueKind::String {
             value.clone()
         } else {
             value.to_string().into()
-        }
+        })
     }
 
     /// Converts the value into a boolean value.
@@ -844,8 +989,8 @@ mod builtins {
     /// {{ 42|bool }} -> true
     /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn bool(value: &Value) -> bool {
-        value.is_true()
+    pub fn bool(state: &State, value: &Value) -> Result<bool, Error> {
+        state.undefined_behavior().is_true(value)
     }
 
     /// Slice an iterable and return a list of lists containing
@@ -965,7 +1110,7 @@ mod builtins {
     /// This filter is only available if the `json` feature is enabled.  The resulting
     /// value is safe to use in HTML as well as it will not contain any special HTML
     /// characters.  The optional parameter to the filter can be set to `true` to enable
-    /// pretty printing.  Not that the `"` character is left unchanged as it's the
+    /// pretty printing.  Note that the `"` character is left unchanged as it's the
     /// JSON string delimiter.  If you want to pass JSON serialized this way into an
     /// HTTP attribute use single quoted HTML attributes:
     ///
@@ -1031,13 +1176,13 @@ mod builtins {
         })
     }
 
-    /// Indents Value with spaces
+    /// Indents a value with spaces.
     ///
     /// The first optional parameter to the filter can be set to `true` to
     /// indent the first line. The parameter defaults to false.
-    /// the second optional parameter to the filter can be set to `true`
+    /// The second optional parameter to the filter can be set to `true`
     /// to indent blank lines. The parameter defaults to false.
-    /// This filter is useful, if you want to template yaml-files
+    /// This filter is useful if you want to template YAML files.
     ///
     /// ```jinja
     /// example:
@@ -1046,33 +1191,56 @@ mod builtins {
     /// {{ global_config|indent(2,true) }}     # indent whole Value with two spaces
     /// {{ global_config|indent(2,true,true)}} # indent whole Value and all blank lines
     /// ```
+    ///
+    /// The parameters can also be provided as keyword arguments for
+    /// compatibility with Jinja2: `width`, `first`, and `blank`.
+    ///
+    /// ```jinja
+    /// {{ global_config|indent(width=4, first=true, blank=false) }}
+    /// ```
     #[cfg_attr(docsrs, doc(cfg(all(feature = "builtins"))))]
     pub fn indent(
-        mut value: String,
-        width: usize,
+        value: StringInput<'_>,
+        width: Option<usize>,
         indent_first_line: Option<bool>,
         indent_blank_lines: Option<bool>,
-    ) -> String {
-        fn strip_trailing_newline(input: &mut String) {
-            if input.ends_with('\n') {
-                input.truncate(input.len() - 1);
+        kwargs: Kwargs,
+    ) -> Result<Value, Error> {
+        fn strip_trailing_newline(mut input: &str) -> &str {
+            if let Some(stripped) = input.strip_suffix('\n') {
+                input = stripped;
             }
-            if input.ends_with('\r') {
-                input.truncate(input.len() - 1);
+            if let Some(stripped) = input.strip_suffix('\r') {
+                input = stripped;
             }
+            input
         }
 
-        strip_trailing_newline(&mut value);
+        let width = match width {
+            Some(width) => width,
+            None => ok!(kwargs.get::<Option<usize>>("width")).unwrap_or(4),
+        };
+        let indent_first_line = match indent_first_line {
+            Some(value) => value,
+            None => ok!(kwargs.get::<Option<bool>>("first")).unwrap_or(false),
+        };
+        let indent_blank_lines = match indent_blank_lines {
+            Some(value) => value,
+            None => ok!(kwargs.get::<Option<bool>>("blank")).unwrap_or(false),
+        };
+        ok!(kwargs.assert_all_used());
+
+        let input = strip_trailing_newline(value.as_str());
         let indent_with = " ".repeat(width);
         let mut output = String::new();
-        let mut iterator = value.split('\n');
-        if !indent_first_line.unwrap_or(false) {
+        let mut iterator = input.split('\n');
+        if !indent_first_line {
             output.push_str(iterator.next().unwrap());
             output.push('\n');
         }
         for line in iterator {
             if line.is_empty() {
-                if indent_blank_lines.unwrap_or(false) {
+                if indent_blank_lines {
                     output.push_str(&indent_with);
                 }
             } else {
@@ -1080,8 +1248,8 @@ mod builtins {
             }
             output.push('\n');
         }
-        strip_trailing_newline(&mut output);
-        output
+        output.truncate(strip_trailing_newline(&output).len());
+        Ok(value.preserve_safety(output))
     }
 
     /// URL encodes a value.
@@ -1396,7 +1564,7 @@ mod builtins {
         safe_sort(&mut items, |a, b| {
             let a = a.get_path_or_default(attr, &default);
             let b = b.get_path_or_default(attr, &default);
-            cmp_helper(&a, &b, case_sensitive)
+            cmp_helper(&a, &b, case_sensitive, false)
         })?;
         ok!(kwargs.assert_all_used());
 
@@ -1436,7 +1604,7 @@ mod builtins {
         for item in items {
             let group_by = item.get_path_or_default(attr, &default);
             if let Some(ref last_grouper) = grouper {
-                if cmp_helper(last_grouper, &group_by, case_sensitive) != Ordering::Equal {
+                if cmp_helper(last_grouper, &group_by, case_sensitive, false) != Ordering::Equal {
                     rv.push(Value::from_object(GroupTuple {
                         grouper: last_grouper.clone(),
                         list: std::mem::take(&mut list),
@@ -1670,8 +1838,42 @@ mod builtins {
     /// [printf-style]: https://docs.python.org/3/library/stdtypes.html#printf-style-string-formatting
     /// [str.format()]: https://docs.python.org/3/library/string.html#format-string-syntax
     #[cfg_attr(docsrs, doc(cfg(feature = "builtins")))]
-    pub fn format(format_str: &str, format_args: Rest<Value>) -> Result<String, Error> {
-        format_filter(FormatStyle::Printf, format_str, &format_args)
+    pub fn format(
+        state: &State,
+        format_str: &Value,
+        format_args: Rest<Value>,
+    ) -> Result<Value, Error> {
+        let string = format_str
+            .as_str()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "value is not a string"))?;
+        if format_str.is_safe() {
+            let output = ok!(format_printf_with(
+                string,
+                &format_args,
+                |value, conversion| {
+                    if conversion == FormatConversion::Character {
+                        return Err(Error::new(
+                            ErrorKind::InvalidOperation,
+                            "character formatting is not supported for safe format strings",
+                        ));
+                    }
+
+                    // Strings are escaped before applying width and precision,
+                    // matching MarkupSafe.  Numbers stay typed so numeric
+                    // conversion specifiers continue to work.
+                    if value.is_safe()
+                        || matches!(value.kind(), ValueKind::Bool | ValueKind::Number)
+                    {
+                        Ok(None)
+                    } else {
+                        escape(state, value).map(|value| Some(Value::from(value.as_str().unwrap())))
+                    }
+                },
+            ));
+            Ok(Value::from_safe_string(output))
+        } else {
+            format_filter(FormatStyle::Printf, string, &format_args).map(Value::from)
+        }
     }
 }
 
