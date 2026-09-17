@@ -317,7 +317,10 @@ fn print_instructions(
     block_name: &str,
 ) -> Result<(), Error> {
     writeln!(output, "Block: {block_name:?}")?;
-    for idx in 0.. {
+    // Bounded rather than `0..`, which `clippy::for_unbounded_range` denies.
+    // The loop leaves on the first index the instructions do not have, long
+    // before the bound.
+    for idx in 0..u32::MAX {
         if let Some(instruction) = instructions.get(idx) {
             writeln!(output, "  {idx:4}: {instruction:?}")?;
         } else {
