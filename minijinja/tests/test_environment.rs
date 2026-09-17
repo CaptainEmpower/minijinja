@@ -211,3 +211,65 @@ fn test_iter() {
     assert!(renders.contains(&("hello", "Hello World!".into())));
     assert!(renders.contains(&("goodbye", "Goodbye World!".into())));
 }
+
+/// A string literal's backslashes taken literally, for an engine whose own
+/// templating does not unescape.
+///
+/// Measured on ansible-core 2.19.13, whose Jinja layer applies no escape
+/// processing to a literal at all:
+///
+/// ```text
+/// {{ '\n' | length }}   2        (Jinja2 and MiniJinja: 1)
+/// {{ '\1' | length }}   2        (Jinja2 and MiniJinja: 1)
+/// {{ '\w' | length }}   2        (an unknown escape: 2 everywhere)
+/// ```
+#[test]
+fn test_keep_string_escapes() {
+    let mut env = Environment::new();
+    env.set_keep_string_escapes(true);
+
+    for (template, expected) in [
+        (r"{{ '\n' | length }}", "2"),
+        (r"{{ '\1' | length }}", "2"),
+        (r"{{ '\b' | length }}", "2"),
+        (r"{{ '\w' | length }}", "2"),
+        (r"{{ '\\' | length }}", "2"),
+    ] {
+        assert_eq!(
+            env.render_str(template, ()).unwrap(),
+            expected,
+            "{template}"
+        );
+    }
+
+    // The literal is the bytes the template wrote, so a regular expression
+    // written inline reaches the filter intact.
+    assert_eq!(
+        env.render_str(r"{{ '\b(?!dev)(\w+)-' | length }}", ())
+            .unwrap(),
+        "15"
+    );
+}
+
+/// Off by default, so every existing template keeps Jinja2's behaviour.
+#[test]
+fn test_string_escapes_are_applied_by_default() {
+    let env = Environment::new();
+
+    assert_eq!(env.render_str(r"{{ '\n' | length }}", ()).unwrap(), "1");
+    assert_eq!(env.render_str(r"{{ '\1' | length }}", ()).unwrap(), "1");
+    assert_eq!(env.render_str(r"{{ '\w' | length }}", ()).unwrap(), "2");
+    assert!(!env.keep_string_escapes());
+}
+
+/// A literal with no backslash at all is unaffected either way, and quotes
+/// still terminate the literal rather than being swallowed.
+#[test]
+fn test_keep_string_escapes_leaves_ordinary_literals_alone() {
+    let mut env = Environment::new();
+    env.set_keep_string_escapes(true);
+
+    assert_eq!(env.render_str("{{ 'plain' }}", ()).unwrap(), "plain");
+    assert_eq!(env.render_str(r#"{{ "a'b" }}"#, ()).unwrap(), "a'b");
+    assert_eq!(env.render_str(r"{{ 'a\'b' | length }}", ()).unwrap(), "4");
+}

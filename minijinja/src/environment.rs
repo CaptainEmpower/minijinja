@@ -260,6 +260,37 @@ impl<'source> Environment<'source> {
             .keep_trailing_newline
     }
 
+    /// Take a string literal's backslashes literally rather than unescaping them.
+    ///
+    /// By default a string literal in a template is unescaped the way Python
+    /// and Jinja2 unescape one, so `'\n'` is a newline and `'\1'` is an octal
+    /// escape. With this set, a backslash is an ordinary character and the
+    /// literal means exactly what it says.
+    ///
+    /// This exists for engines embedding MiniJinja whose own templating does
+    /// not unescape. Ansible is one: measured on ansible-core 2.19.13,
+    /// `{{ '\n' | length }}` is 2 and `{{ '\1' | length }}` is 2, where both
+    /// are 1 under Jinja2. It matters most for a regular expression written
+    /// inline --- `regex_replace('\b(?!dev)(\w+)-', 'X-')` --- where
+    /// unescaping turns `\b` into a backspace and the pattern silently stops
+    /// matching.
+    ///
+    /// The default is `false`, which is Jinja2's behaviour.
+    ///
+    /// This setting is used whenever a template is loaded into the environment.
+    /// Changing it at a later point only affects future templates loaded.
+    pub fn set_keep_string_escapes(&mut self, yes: bool) {
+        self.templates
+            .template_config
+            .ws_config
+            .keep_string_escapes = yes;
+    }
+
+    /// Returns the value of the string escape preservation flag.
+    pub fn keep_string_escapes(&self) -> bool {
+        self.templates.template_config.ws_config.keep_string_escapes
+    }
+
     /// Remove the first newline after a block.
     ///
     /// If this is set to `true` then the first newline after a block is removed

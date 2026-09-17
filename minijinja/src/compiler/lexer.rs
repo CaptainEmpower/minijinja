@@ -12,6 +12,10 @@ pub struct WhitespaceConfig {
     pub keep_trailing_newline: bool,
     pub lstrip_blocks: bool,
     pub trim_blocks: bool,
+    /// Take a string literal's backslashes literally rather than unescaping.
+    ///
+    /// See [`Environment::set_keep_string_escapes`](crate::Environment::set_keep_string_escapes).
+    pub keep_string_escapes: bool,
 }
 
 /// Tokenizes jinja templates.
@@ -548,7 +552,10 @@ impl<'s> Tokenizer<'s> {
             return Err(self.syntax_error("unexpected end of string"));
         }
         let s = self.advance(str_len + 2);
-        Ok(if has_escapes {
+        // With `keep_string_escapes`, a backslash is an ordinary character and
+        // the literal is borrowed as written -- the same path an unescaped
+        // literal already takes, so it costs nothing.
+        Ok(if has_escapes && !self.ws_config.keep_string_escapes {
             (
                 Token::String(ok!(unescape(&s[1..s.len() - 1])).into_boxed_str()),
                 self.span(old_loc),
