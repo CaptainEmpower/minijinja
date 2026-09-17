@@ -15,7 +15,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          # Matches `minijinja-go/go.mod`, and `release.yml`, which already
+          # pins 1.23.x. With 1.21 the job still passed, but only because
+          # Go's automatic toolchain switching downloaded go1.23.0 mid-run --
+          # an implicit network fetch standing in for the pin.
+          go-version: '1.23'
       - name: Check
         run: make check
       - name: Test
