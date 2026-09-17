@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::compiler::codegen::CodeGenerator;
 use crate::compiler::instructions::Instructions;
-use crate::compiler::parser::parse_expr_with_config;
+use crate::compiler::parser::parse_expr;
 use crate::error::{attach_basic_debug_info, Error, ErrorKind};
 use crate::expression::Expression;
 use crate::output::Output;
@@ -737,7 +737,7 @@ impl<'source> Environment<'source> {
 
     fn _compile_expression<'expr>(&self, expr: &'expr str) -> Result<Instructions<'expr>, Error> {
         attach_basic_debug_info(
-            parse_expr_with_config(
+            parse_expr(
                 expr,
                 self.template_config().syntax_config.clone(),
                 self.template_config().ws_config,

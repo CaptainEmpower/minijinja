@@ -1398,21 +1398,17 @@ pub fn parse<'source>(
     Parser::new(source, filename, false, syntax_config, whitespace_config).parse()
 }
 
-/// Parses a standalone expression with the default configuration.
-pub fn parse_expr(source: &str) -> Result<ast::Expr<'_>, Error> {
-    parse_expr_with_config(source, Default::default(), Default::default())
-}
-
-/// Parses a standalone expression under an environment's configuration.
+/// Parses a standalone expression.
 ///
-/// A standalone expression has no blocks, so most of `whitespace_config` is
+/// The configuration is taken rather than defaulted, as [`parse`] takes it. A
+/// standalone expression has no blocks, so most of `whitespace_config` is
 /// inert here -- but `keep_string_escapes` is not: it decides what a string
-/// literal *means*, and an expression compiled with the default would read
+/// literal *means*, and an expression parsed with the default would read
 /// `'\n'` as a newline where the same literal in a template read it as two
-/// characters. Threading the configuration through keeps
+/// characters. Threading it through keeps
 /// [`Environment::compile_expression`](crate::Environment::compile_expression)
 /// answering what the environment's own templates answer.
-pub fn parse_expr_with_config(
+pub fn parse_expr(
     source: &str,
     syntax_config: SyntaxConfig,
     whitespace_config: WhitespaceConfig,
