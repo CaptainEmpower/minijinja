@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::compiler::codegen::CodeGenerator;
 use crate::compiler::instructions::Instructions;
-use crate::compiler::parser::parse_expr;
+use crate::compiler::parser::parse_expr_with_config;
 use crate::error::{attach_basic_debug_info, Error, ErrorKind};
 use crate::expression::Expression;
 use crate::output::Output;
@@ -280,10 +280,7 @@ impl<'source> Environment<'source> {
     /// This setting is used whenever a template is loaded into the environment.
     /// Changing it at a later point only affects future templates loaded.
     pub fn set_keep_string_escapes(&mut self, yes: bool) {
-        self.templates
-            .template_config
-            .ws_config
-            .keep_string_escapes = yes;
+        self.templates.template_config.ws_config.keep_string_escapes = yes;
     }
 
     /// Returns the value of the string escape preservation flag.
@@ -729,9 +726,23 @@ impl<'source> Environment<'source> {
         .map(|instr| Expression::new_owned(self, instr))
     }
 
+    /// The configuration templates are compiled with.
+    ///
+    /// A standalone expression must be parsed under the same configuration as
+    /// a template, or `keep_string_escapes` and a custom syntax would apply to
+    /// one and not the other.
+    pub(crate) fn template_config(&self) -> &TemplateConfig {
+        &self.templates.template_config
+    }
+
     fn _compile_expression<'expr>(&self, expr: &'expr str) -> Result<Instructions<'expr>, Error> {
         attach_basic_debug_info(
-            parse_expr(expr).map(|ast| {
+            parse_expr_with_config(
+                expr,
+                self.template_config().syntax_config.clone(),
+                self.template_config().ws_config,
+            )
+            .map(|ast| {
                 let mut g = CodeGenerator::new("<expression>", expr);
                 g.compile_expr(&ast);
                 g.finish().0

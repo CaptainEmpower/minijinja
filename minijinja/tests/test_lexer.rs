@@ -38,6 +38,7 @@ impl TestSettings {
                 keep_trailing_newline: self.keep_trailing_newline,
                 lstrip_blocks: self.lstrip_blocks,
                 trim_blocks: self.trim_blocks,
+                ..Default::default()
             },
         )
     }

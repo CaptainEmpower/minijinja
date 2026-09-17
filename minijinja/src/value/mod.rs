@@ -1412,7 +1412,9 @@ impl Value {
     pub fn get_attr_chainable(&self, key: &str) -> Value {
         match self.0 {
             ValueRepr::Undefined(_) => Value::UNDEFINED,
-            ValueRepr::Object(ref dy) => dy.get_value(&Value::from(key)).unwrap_or(Value::UNDEFINED),
+            ValueRepr::Object(ref dy) => {
+                dy.get_value(&Value::from(key)).unwrap_or(Value::UNDEFINED)
+            }
             _ => Value::UNDEFINED,
         }
     }

@@ -251,6 +251,30 @@ fn test_keep_string_escapes() {
     );
 }
 
+/// `compile_expression` compiles under the environment's configuration too.
+///
+/// It used to parse with `Default::default()` regardless, so an expression
+/// read `'\n'` as a newline while the same literal in a template read it as
+/// two characters. An embedder that renders a bare `{{ ... }}` through an
+/// expression rather than a template got the opposite answer from the one it
+/// asked for, silently.
+#[test]
+fn test_keep_string_escapes_applies_to_compiled_expressions() {
+    let mut env = Environment::new();
+    env.set_keep_string_escapes(true);
+
+    let expr = env
+        .compile_expression(r"'\b(?!dev)(\w+)-' | length")
+        .unwrap();
+    assert_eq!(expr.eval(()).unwrap().to_string(), "15");
+
+    let default = Environment::new();
+    let expr = default
+        .compile_expression(r"'\b(?!dev)(\w+)-' | length")
+        .unwrap();
+    assert_eq!(expr.eval(()).unwrap().to_string(), "14");
+}
+
 /// Off by default, so every existing template keeps Jinja2's behaviour.
 #[test]
 fn test_string_escapes_are_applied_by_default() {
