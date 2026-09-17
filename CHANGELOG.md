@@ -2,6 +2,100 @@
 
 All notable changes to MiniJinja are documented here.
 
+## Unreleased
+
+## 2.24.0
+
+* Added the `wordwrap` filter to the Python bindings.  #885
+* Fixed conditional expressions in keyword argument values for Jinja2 compatibility in Rust and Go.  #921
+* Fixed `context!` sorting keys when the `preserve_order` feature is enabled.  #920
+* Limited string repetition to 100 MB in Rust and Go to prevent excessive memory allocations.
+
+## 2.23.0
+
+* Fixed Unicode identifiers in templates rendered through the Python bindings.
+
+## 2.22.0
+
+* Changed rendering of none and boolean values to `None`, `True`, and `False` for Jinja2 compatibility in Rust and Go.  #913
+* Added `StringInput` for custom Rust filters and functions that transform strings while preserving safety provenance.
+* Fixed safety handling in string-transforming and composing filters to preserve safe strings and escape unsafe fragments in Rust and Go.
+* Fixed the `split` filter to return a sequence, enabling negative indexing and slicing in Rust and Go.  #909
+* Fixed Python-compatible dict methods being shadowed by same-named map keys.  #903
+* Fixed loop-local assignments leaking into subsequent iterations in Rust and Go.  #912
+
+## 2.21.0
+
+* Fixed a panic when comparing two numbers that have no common lossless representation, such as a float against an integer that cannot be represented exactly as `f64` (for example `1.0 < 9007199254740993`).  #904
+* Fixed a stack overflow caused by repeated sequence concatenation.  #907
+* Improved performance of iteration over map items.  #906
+
+## 2.20.0
+
+* Added support for Jinja-style `required` blocks in Rust and Go, including `scoped required` parsing compatibility and validation that required blocks only contain whitespace or comments.
+* Added support for chained comparisons (for example `a < b < c`) in Rust and Go to match Jinja/Python semantics.
+* Fixed dotted integer lookup in the middle of attribute chains (for example `foo.0.bar`) for Jinja compatibility.  #900
+* Fixed compilation with `multi_template` disabled by gating block-only APIs behind the feature.
+
+## 2.19.0
+
+* Fixed strict undefined behavior for comparison operators (such as `==`), string concatenation (`~`), and undefined needles in the `in` operator to better match Jinja2.  #886 #888
+* Fixed the `default` filter in strict undefined mode so an explicitly passed undefined fallback argument errors instead of being treated like a missing argument.  #887
+
+## 2.18.0
+
+* Added keyword argument support (`width`, `first`, `blank`) to the `indent` filter for Jinja2 compatibility in Rust and Go.  #864
+* Added support for dotted integer lookup (for example `foo.0`) in Rust and Go for Jinja compatibility.  #881
+* Added support for dotted filter and test names (including `foo . bar . baz`) for Jinja compatibility.  #879
+* Fixed string escape handling to preserve unknown escapes (such as `\s`) for Jinja compatibility in Rust and Go.  #880
+* Improved generic performance across template parsing, compilation, and rendering.
+* Fixed `minijinja-cabi` ownership and pointer-safety issues that could leak `mj_value`
+  values on error paths.
+* Added high-priority `minijinja-cabi` APIs for callback-based functions/filters/tests,
+  globals, loaders, path joining, auto-escape configuration, and fuel limits.
+* Switched `minijinja-cabi` header maintenance to manual source-based syncing and
+  removed cbindgen-based generation tooling.
+* Added lightweight C smoke tests for `minijinja-cabi` (via `make -C minijinja-cabi test`)
+  with coverage across all exported C ABI functions, and wired them into top-level
+  testing and CI.
+* Added `render_captured` and `render_captured_to` methods on `Template` which
+  return a `Captured` type holding the rendered output and the template state.
+* Added `into_output` method on `Captured` to consume and return the output string.
+* Deprecated `render_and_return_state`, `eval_to_state`, and `render_to_write`
+  in favor of the new `render_captured` / `render_captured_to` / `Captured` API.
+
+## 2.17.1
+
+* Re-release of 2.17.0 to fix release automation.
+* Switched npm publishing to trusted publishing (OIDC/provenance) and removed token-based auth from CI.
+* Prevented duplicate crates.io publish attempts by skipping slash-prefixed tags in crates publishing.
+
+## 2.17.0
+
+* Added `'c'` (character) format type support for format filters and `str.format`-style formatting.  #868
+* Added prebuilt `minijinja-cli` release targets for `aarch64-pc-windows-msvc` (Windows ARM64) and `armv7-unknown-linux-gnueabihf`.
+* Fixed strict and semi-strict undefined handling so string-coercing filter/function arguments also fail for nested `Rest<String>` and `Vec<String>` conversions.  #877
+* Fixed Python CI/build compatibility with newer `maturin` by moving stripping from global config to release wheel build arguments.
+
+## 2.16.0
+
+* Added musllinux wheel builds for Python release artifacts.
+* Fixed `|escape` to honor custom formatters.  #861
+* Aligned undefined behavior handling in the Go port with Rust.
+* Removed non-Rust `keys` and `values` filters from the Go port for parity.  #863
+
+## 2.15.1
+
+* Re-release of 2.15.0 because of a bad release.
+
+## 2.15.0
+
+* Added `py.typed` marker for PEP 561 typing support in Python bindings.  #853
+* Added optional default argument to `map.get()` method in pycompat.  #852
+* Added a go language port.  #854
+* Fixed stability guarantees for the `|sort` filter when using `reverse=true`.  #856
+* Fixed missing `SemiStrict` undefined mapping in Python bindings.  #859
+
 ## 2.14.0
 
 * Added support for tuple unpacking in `{% set %}` statements.  #847

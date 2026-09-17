@@ -42,9 +42,16 @@ fn test_expression_owned() {
 }
 
 #[test]
-fn test_expression_bug() {
+fn test_trailing_garbage_rejected() {
     let env = Environment::new();
-    assert!(env.compile_expression("42.blahadsf()").is_err());
+    assert!(env.compile_expression("42 blahadsf").is_err());
+}
+
+#[test]
+fn test_int_method_call_compiles() {
+    let env = Environment::new();
+    let expr = env.compile_expression("42.blahadsf()").unwrap();
+    assert!(expr.eval(()).is_err());
 }
 
 #[test]
@@ -173,6 +180,11 @@ fn test_unknown_method_callback() {
 
     let rv = env.render_str("{{ {'x': 42}.items() }}", ()).unwrap();
     assert_snapshot!(rv, @r###"[["x", 42]]"###);
+
+    let rv = env
+        .render_str("{{ {'items': 'field', 'x': 42}.items() | length }}", ())
+        .unwrap();
+    assert_eq!(rv, "2");
 
     let err = env.render_str("{{ [].does_not_exist() }}", ()).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::UnknownMethod);

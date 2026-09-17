@@ -64,7 +64,7 @@ jobs:
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.29.0/cargo-dist-installer.sh | sh"
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh"
       - name: Cache dist
         uses: actions/upload-artifact@v4
         with:
@@ -292,6 +292,42 @@ jobs:
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+      - name: Tag Go module release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ needs.plan.outputs.tag }}"
+          version="${version##*/}"
+          if [[ "$version" != v* ]]; then
+            version="v${version}"
+          fi
+          go_tag="minijinja-go/${version}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${go_tag}" >/dev/null 2>&1; then
+            echo "Go tag ${go_tag} already exists"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git tag "${go_tag}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${go_tag}"
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+      - name: Prewarm pkg.go.dev
+        shell: bash
+        run: |
+          version="${{ needs.plan.outputs.tag }}"
+          version="${version##*/}"
+          if [[ "$version" != v* ]]; then
+            version="v${version}"
+          fi
+          # Warm the Go module proxy
+          GOPROXY=proxy.golang.org go list -m github.com/mitsuhiko/minijinja/minijinja-go/v2@"$version"
+          # Trigger pkg.go.dev to index the module
+          curl -s -X POST "https://pkg.go.dev/fetch/github.com/mitsuhiko/minijinja/minijinja-go/v2@$version"
 
   announce:
     needs:

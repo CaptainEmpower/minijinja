@@ -45,6 +45,11 @@ def test_expression():
     assert rv == list(range(10))
 
 
+def test_non_ascii_identifier():
+    env = Environment(templates={"t": "{{ ミニ神社 }}"})
+    assert env.render_template("t", **{"ミニ神社": "minijinja"}) == "minijinja"
+
+
 def test_pass_callable():
     def magic():
         return [1, 2, 3]
@@ -526,6 +531,14 @@ def test_striptags():
     env = Environment()
     assert env.eval_expr("'<a>foo</a>'|striptags") == "foo"
     assert env.eval_expr("'<a>&auml;</a>'|striptags") == "ä"
+
+
+def test_wordwrap():
+    env = Environment()
+    assert (
+        env.eval_expr("text|wordwrap(width=20)", text="the quick brown fox jumps")
+        == "the quick brown fox\njumps"
+    )
 
 
 def test_attribute_lookups():

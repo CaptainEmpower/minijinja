@@ -211,14 +211,16 @@ use serde::ser::{Serialize, SerializeTupleStruct, Serializer};
 
 use crate::error::{Error, ErrorKind};
 use crate::functions;
-use crate::utils::OnDrop;
 use crate::value::ops::as_f64;
 use crate::value::serialize::transform;
 use crate::vm::State;
 
-pub use crate::value::argtypes::{from_args, ArgType, FunctionArgs, FunctionResult, Kwargs, Rest};
+pub use crate::value::argtypes::{
+    from_args, ArgType, FunctionArgs, FunctionResult, Kwargs, Rest, StringInput,
+};
 pub use crate::value::merge_object::merge_maps;
 pub use crate::value::object::{DynObject, Enumerator, Object, ObjectExt, ObjectRepr};
+pub(crate) use crate::value::serialize::StaticKeyMap;
 
 #[macro_use]
 mod type_erase;
@@ -257,13 +259,50 @@ pub(crate) fn value_map_with_capacity(capacity: usize) -> ValueMap {
     }
 }
 
+pub(crate) struct ValueHandleRegistry {
+    single: Option<(u32, Value)>,
+    overflow: BTreeMap<u32, Value>,
+}
+
+impl ValueHandleRegistry {
+    const fn new() -> Self {
+        Self {
+            single: None,
+            overflow: BTreeMap::new(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn insert(&mut self, handle: u32, value: Value) {
+        if self.single.is_none() && self.overflow.is_empty() {
+            self.single = Some((handle, value));
+            return;
+        }
+
+        if let Some((other_handle, other_value)) = self.single.take() {
+            self.overflow.insert(other_handle, other_value);
+        }
+        self.overflow.insert(handle, value);
+    }
+
+    #[inline(always)]
+    pub(crate) fn remove(&mut self, handle: u32) -> Option<Value> {
+        if let Some((single_handle, _)) = self.single {
+            if single_handle == handle {
+                return self.single.take().map(|(_, value)| value);
+            }
+        }
+        self.overflow.remove(&handle)
+    }
+}
+
 thread_local! {
     static INTERNAL_SERIALIZATION: Cell<bool> = const { Cell::new(false) };
 
     // This should be an AtomicU64 but sadly 32bit targets do not necessarily have
     // AtomicU64 available.
     static LAST_VALUE_HANDLE: Cell<u32> = const { Cell::new(0) };
-    static VALUE_HANDLES: RefCell<BTreeMap<u32, Value>> = const { RefCell::new(BTreeMap::new()) };
+    static VALUE_HANDLES: RefCell<ValueHandleRegistry> = const { RefCell::new(ValueHandleRegistry::new()) };
 }
 
 /// Function that returns true when serialization for [`Value`] is taking place.
@@ -286,17 +325,17 @@ pub fn serializing_for_value() -> bool {
     INTERNAL_SERIALIZATION.with(|flag| flag.get())
 }
 
-fn mark_internal_serialization() -> impl Drop {
-    let old = INTERNAL_SERIALIZATION.with(|flag| {
-        let old = flag.get();
-        flag.set(true);
-        old
-    });
-    OnDrop::new(move || {
-        if !old {
-            INTERNAL_SERIALIZATION.with(|flag| flag.set(false));
+struct InternalSerializationGuard<'a> {
+    flag: &'a Cell<bool>,
+    reset_on_drop: bool,
+}
+
+impl Drop for InternalSerializationGuard<'_> {
+    fn drop(&mut self) {
+        if self.reset_on_drop {
+            self.flag.set(false);
         }
-    })
+    }
 }
 
 /// Describes the kind of value.
@@ -438,11 +477,11 @@ impl fmt::Debug for ValueRepr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             ValueRepr::Undefined(_) => f.write_str("undefined"),
-            ValueRepr::Bool(ref val) => fmt::Debug::fmt(val, f),
+            ValueRepr::Bool(val) => f.write_str(if val { "True" } else { "False" }),
             ValueRepr::U64(ref val) => fmt::Debug::fmt(val, f),
             ValueRepr::I64(ref val) => fmt::Debug::fmt(val, f),
             ValueRepr::F64(ref val) => fmt::Debug::fmt(val, f),
-            ValueRepr::None => f.write_str("none"),
+            ValueRepr::None => f.write_str("None"),
             ValueRepr::Invalid(ref val) => write!(f, "<invalid value: {val}>"),
             ValueRepr::U128(val) => fmt::Debug::fmt(&{ val.0 }, f),
             ValueRepr::I128(val) => fmt::Debug::fmt(&{ val.0 }, f),
@@ -588,6 +627,90 @@ fn f64_total_cmp(left: f64, right: f64) -> Ordering {
     left.cmp(&right)
 }
 
+fn cmp_f64(left: f64, right: f64) -> Ordering {
+    if left == right {
+        Ordering::Equal
+    } else {
+        f64_total_cmp(left, right)
+    }
+}
+
+#[derive(Copy, Clone)]
+enum Number {
+    I128(i128),
+    U128(u128),
+    F64(f64),
+}
+
+fn number(value: &Value) -> Option<Number> {
+    Some(match &value.0 {
+        ValueRepr::U64(x) => Number::U128(*x as u128),
+        ValueRepr::U128(x) => Number::U128(x.0),
+        ValueRepr::I64(x) => Number::I128(*x as i128),
+        ValueRepr::I128(x) => Number::I128(x.0),
+        ValueRepr::F64(x) => Number::F64(*x),
+        _ => return None,
+    })
+}
+
+fn cmp_i128_u128(left: i128, right: u128) -> Ordering {
+    if left < 0 {
+        Ordering::Less
+    } else {
+        (left as u128).cmp(&right)
+    }
+}
+
+fn cmp_f64_i128(left: f64, right: i128) -> Ordering {
+    match cmp_f64(left, right as f64) {
+        Ordering::Equal if left.is_finite() => {
+            if left >= i128::MAX as f64 {
+                Ordering::Greater
+            } else {
+                let trunc = left.trunc();
+                (trunc as i128)
+                    .cmp(&right)
+                    .then_with(|| left.partial_cmp(&trunc).unwrap())
+            }
+        }
+        rv => rv,
+    }
+}
+
+fn cmp_f64_u128(left: f64, right: u128) -> Ordering {
+    match cmp_f64(left, right as f64) {
+        Ordering::Equal if left.is_finite() => {
+            if left < 0.0 {
+                Ordering::Less
+            } else if left >= u128::MAX as f64 {
+                Ordering::Greater
+            } else {
+                (left as u128).cmp(&right)
+            }
+        }
+        rv => rv,
+    }
+}
+
+// This is only needed when `coerce` cannot find a common lossless numeric
+// representation.  Keep it out of line so the rare fallback does not bloat the
+// hot comparison path.
+#[cold]
+#[inline(never)]
+fn cmp_uncoercible_numbers(left: &Value, right: &Value) -> Ordering {
+    match (number(left).unwrap(), number(right).unwrap()) {
+        (Number::F64(a), Number::F64(b)) => cmp_f64(a, b),
+        (Number::F64(a), Number::I128(b)) => cmp_f64_i128(a, b),
+        (Number::I128(a), Number::F64(b)) => cmp_f64_i128(b, a).reverse(),
+        (Number::F64(a), Number::U128(b)) => cmp_f64_u128(a, b),
+        (Number::U128(a), Number::F64(b)) => cmp_f64_u128(b, a).reverse(),
+        (Number::I128(a), Number::I128(b)) => a.cmp(&b),
+        (Number::U128(a), Number::U128(b)) => a.cmp(&b),
+        (Number::I128(a), Number::U128(b)) => cmp_i128_u128(a, b),
+        (Number::U128(a), Number::I128(b)) => cmp_i128_u128(b, a).reverse(),
+    }
+}
+
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
         let kind_ordering = self.kind().cmp(&other.kind());
@@ -602,11 +725,18 @@ impl Ord for Value {
                 a.as_str().cmp(b.as_str())
             }
             (&ValueRepr::Bytes(ref a), &ValueRepr::Bytes(ref b)) => a.cmp(b),
+            // `coerce` represents two u128 values as i128, which reverses the
+            // order if only one of them exceeds i128::MAX.
+            (&ValueRepr::U128(a), &ValueRepr::U128(b)) => { a.0 }.cmp(&{ b.0 }),
             _ => match ops::coerce(self, other, false) {
-                Some(ops::CoerceResult::F64(a, b)) => f64_total_cmp(a, b),
+                Some(ops::CoerceResult::F64(a, b)) => cmp_f64(a, b),
                 Some(ops::CoerceResult::I128(a, b)) => a.cmp(&b),
                 Some(ops::CoerceResult::Str(a, b)) => a.cmp(b),
                 None => {
+                    if self.is_number() && other.is_number() {
+                        return cmp_uncoercible_numbers(self, other);
+                    }
+
                     let a = self.as_object().unwrap();
                     let b = other.as_object().unwrap();
 
@@ -661,7 +791,7 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             ValueRepr::Undefined(_) => Ok(()),
-            ValueRepr::Bool(val) => val.fmt(f),
+            ValueRepr::Bool(val) => f.write_str(if val { "True" } else { "False" }),
             ValueRepr::U64(val) => val.fmt(f),
             ValueRepr::I64(val) => val.fmt(f),
             ValueRepr::F64(val) => {
@@ -677,7 +807,7 @@ impl fmt::Display for Value {
                     write!(f, "{num}")
                 }
             }
-            ValueRepr::None => f.write_str("none"),
+            ValueRepr::None => f.write_str("None"),
             ValueRepr::Invalid(ref val) => write!(f, "<invalid value: {val}>"),
             ValueRepr::I128(val) => write!(f, "{}", { val.0 }),
             ValueRepr::String(ref val, _) => write!(f, "{val}"),
@@ -738,8 +868,14 @@ impl Value {
     /// [`deserialize`](serde::Deserialize::deserialize) method of a type that supports
     /// serde deserialization.
     pub fn from_serialize<T: Serialize>(value: T) -> Value {
-        let _serialization_guard = mark_internal_serialization();
-        transform(value)
+        INTERNAL_SERIALIZATION.with(|flag| {
+            let old = flag.replace(true);
+            let _serialization_guard = InternalSerializationGuard {
+                flag,
+                reset_on_drop: !old,
+            };
+            transform(value)
+        })
     }
 
     /// Extracts a contained error.
@@ -1254,7 +1390,7 @@ impl Value {
     pub fn get_attr(&self, key: &str) -> Result<Value, Error> {
         let value = match self.0 {
             ValueRepr::Undefined(_) => return Err(Error::from(ErrorKind::UndefinedError)),
-            ValueRepr::Object(ref dy) => dy.get_value(&Value::from(key)),
+            ValueRepr::Object(ref dy) => dy.get_value_by_str(key),
             _ => None,
         };
 
@@ -1289,7 +1425,7 @@ impl Value {
     /// also not be created.
     pub(crate) fn get_attr_fast(&self, key: &str) -> Option<Value> {
         match self.0 {
-            ValueRepr::Object(ref dy) => dy.get_value(&Value::from(key)),
+            ValueRepr::Object(ref dy) => dy.get_value_by_str(key),
             _ => None,
         }
     }
@@ -1417,12 +1553,46 @@ impl Value {
                         Box::new(v.iter().cloned())
                     }))
                 }
+                Enumerator::KeyValueIter(iter) => {
+                    let mut v = if let ObjectRepr::Map = o.repr() {
+                        iter.map(|(k, _)| k).collect::<Vec<_>>()
+                    } else {
+                        iter.map(|(k, v)| [k, v].into()).collect::<Vec<_>>()
+                    };
+                    v.reverse();
+                    Some(Value::make_object_iterable(v, move |v| {
+                        Box::new(v.iter().cloned())
+                    }))
+                }
                 Enumerator::RevIter(rev_iter) => {
                     let for_restart = self.clone();
                     let iter = Mutex::new(Some(rev_iter));
                     Some(Value::make_iterable(move || {
                         if let Some(iter) = iter.lock().unwrap().take() {
                             Box::new(iter) as Box<dyn Iterator<Item = Value> + Send + Sync>
+                        } else {
+                            match for_restart.reverse().and_then(|x| x.try_iter()) {
+                                Ok(iterable) => Box::new(iterable)
+                                    as Box<dyn Iterator<Item = Value> + Send + Sync>,
+                                Err(err) => Box::new(Some(Value::from(err)).into_iter())
+                                    as Box<dyn Iterator<Item = Value> + Send + Sync>,
+                            }
+                        }
+                    }))
+                }
+                Enumerator::RevKeyValueIter(rev_iter) => {
+                    let for_restart = self.clone();
+                    let iter = Mutex::new(Some(rev_iter));
+                    let repr = o.repr();
+                    Some(Value::make_iterable(move || {
+                        if let Some(iter) = iter.lock().unwrap().take() {
+                            if let ObjectRepr::Map = repr {
+                                Box::new(iter.map(|(k, _)| k))
+                                    as Box<dyn Iterator<Item = Value> + Send + Sync>
+                            } else {
+                                Box::new(iter.map(|(k, v)| [k, v].into()))
+                                    as Box<dyn Iterator<Item = Value> + Send + Sync>
+                            }
                         } else {
                             match for_restart.reverse().and_then(|x| x.try_iter()) {
                                 Ok(iterable) => Box::new(iterable)
@@ -1602,7 +1772,9 @@ impl Value {
     /// Calls a method on the value.
     ///
     /// The name of the method is `name`, the arguments passed are in the `args`
-    /// slice.
+    /// slice.  Method lookup first tries methods implemented by the object, then
+    /// the environment's unknown method callback, and finally a callable value
+    /// stored under `name` on the object.
     pub fn call_method(&self, state: &State, name: &str, args: &[Value]) -> Result<Value, Error> {
         match self._call_method(state, name, args) {
             Ok(rv) => Ok(rv),
@@ -1623,6 +1795,17 @@ impl Value {
                             }
                         }
                     }
+                    // Calling values stored on objects by using method syntax is
+                    // supported as a fallback.  This must happen after the unknown
+                    // method callback so that type methods take precedence over
+                    // same-named items, as they do in Jinja2.
+                    if let Some(value) = self
+                        .as_object()
+                        .and_then(|object| object.get_value(&Value::from(name)))
+                    {
+                        return value.call(state, args);
+                    }
+
                     if err.detail().is_none() {
                         err.set_detail(format!("{} has no method named {}", self.kind(), name));
                     }
@@ -1866,5 +2049,24 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     fn test_sizes() {
         assert_eq!(std::mem::size_of::<Value>(), 24);
+    }
+
+    #[test]
+    fn test_cmp_number_no_exact_coercion() {
+        let pow53 = 9007199254740992_i64;
+        let value = Value::from(pow53 + 1);
+
+        assert!(Value::from(1.0) < value);
+        assert!(value > Value::from(1.0));
+
+        let exact_float = Value::from(pow53 as f64);
+        let exact_int = Value::from(pow53);
+        assert_eq!(exact_float.cmp(&exact_int), Ordering::Equal);
+        assert_eq!(exact_float.cmp(&value), Ordering::Less);
+        assert_eq!(exact_int.cmp(&value), Ordering::Less);
+
+        let huge = Value::from(u128::MAX);
+        assert!(Value::from(0_u128) < huge);
+        assert!(Value::from(1_i64) < huge);
     }
 }

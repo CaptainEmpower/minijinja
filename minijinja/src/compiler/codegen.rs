@@ -1,8 +1,11 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::mem;
 
 use crate::compiler::ast;
 use crate::compiler::instructions::{
-    Instruction, Instructions, LocalId, LOOP_FLAG_RECURSIVE, LOOP_FLAG_WITH_LOOP_VAR, MAX_LOCALS,
+    CompareOp, Instruction, Instructions, LocalId, LOOP_FLAG_RECURSIVE, LOOP_FLAG_WITH_LOOP_VAR,
+    MAX_LOCALS,
 };
 use crate::compiler::tokens::Span;
 use crate::output::CaptureMode;
@@ -31,6 +34,19 @@ fn get_local_id<'source>(ids: &mut BTreeMap<&'source str, LocalId>, name: &'sour
     }
 }
 
+fn compare_op(op: ast::CompareOpKind) -> CompareOp {
+    match op {
+        ast::CompareOpKind::Eq => CompareOp::Eq,
+        ast::CompareOpKind::Ne => CompareOp::Ne,
+        ast::CompareOpKind::Lt => CompareOp::Lt,
+        ast::CompareOpKind::Lte => CompareOp::Lte,
+        ast::CompareOpKind::Gt => CompareOp::Gt,
+        ast::CompareOpKind::Gte => CompareOp::Gte,
+        ast::CompareOpKind::In => CompareOp::In,
+        ast::CompareOpKind::NotIn => CompareOp::NotIn,
+    }
+}
+
 /// Represents an open block of code that does not yet have updated
 /// jump targets.
 enum PendingBlock {
@@ -44,6 +60,58 @@ enum PendingBlock {
     ScBool {
         jump_instrs: Vec<u32>,
     },
+}
+
+const CODEGEN_POOL_MAX_ITEMS: usize = 64;
+const CODEGEN_POOLED_MAX_CAPACITY: usize = 64;
+
+thread_local! {
+    static PENDING_BLOCK_POOL: RefCell<Vec<Vec<PendingBlock>>> = const { RefCell::new(Vec::new()) };
+    static SPAN_STACK_POOL: RefCell<Vec<Vec<Span>>> = const { RefCell::new(Vec::new()) };
+}
+
+#[inline(always)]
+fn take_pending_block_buffer() -> Vec<PendingBlock> {
+    let mut buf = PENDING_BLOCK_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_else(|| Vec::with_capacity(8));
+    buf.clear();
+    buf
+}
+
+#[inline(always)]
+fn take_span_stack_buffer() -> Vec<Span> {
+    let mut buf = SPAN_STACK_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_else(|| Vec::with_capacity(8));
+    buf.clear();
+    buf
+}
+
+#[inline(always)]
+fn recycle_pending_block_buffer(mut buf: Vec<PendingBlock>) {
+    if buf.capacity() <= CODEGEN_POOLED_MAX_CAPACITY {
+        buf.clear();
+        PENDING_BLOCK_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < CODEGEN_POOL_MAX_ITEMS {
+                pool.push(buf);
+            }
+        });
+    }
+}
+
+#[inline(always)]
+fn recycle_span_stack_buffer(mut buf: Vec<Span>) {
+    if buf.capacity() <= CODEGEN_POOLED_MAX_CAPACITY {
+        buf.clear();
+        SPAN_STACK_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < CODEGEN_POOL_MAX_ITEMS {
+                pool.push(buf);
+            }
+        });
+    }
 }
 
 /// Provides a convenient interface to creating instructions for the VM.
@@ -64,9 +132,9 @@ impl<'source> CodeGenerator<'source> {
         CodeGenerator {
             instructions: Instructions::new(file, source),
             blocks: BTreeMap::new(),
-            pending_block: Vec::with_capacity(32),
+            pending_block: take_pending_block_buffer(),
             current_line: 0,
-            span_stack: Vec::with_capacity(32),
+            span_stack: take_span_stack_buffer(),
             filter_local_ids: BTreeMap::new(),
             test_local_ids: BTreeMap::new(),
             raw_template_bytes: 0,
@@ -407,6 +475,7 @@ impl<'source> CodeGenerator<'source> {
         for node in &block.body {
             sub.compile_stmt(node);
         }
+        sub.instructions.mark_required_block(block.required);
         let instructions = self.finish_subgenerator(sub);
         self.blocks.insert(block.name, instructions);
         self.add(Instruction::CallBlock(block.name));
@@ -655,6 +724,9 @@ impl<'source> CodeGenerator<'source> {
             ast::Expr::BinOp(c) => {
                 self.compile_bin_op(c);
             }
+            ast::Expr::Compare(c) => {
+                self.compile_compare(c);
+            }
             ast::Expr::IfExpr(i) => {
                 self.set_line_from_span(i.span());
                 self.compile_expr(&i.test_expr);
@@ -868,6 +940,58 @@ impl<'source> CodeGenerator<'source> {
         }
     }
 
+    fn compile_compare(&mut self, c: &ast::Spanned<ast::Compare<'source>>) {
+        self.push_span(c.span());
+        self.compile_expr(&c.expr);
+        let mut cleanup_jumps = Vec::new();
+        for (idx, op) in c.ops.iter().enumerate() {
+            self.compile_expr(&op.expr);
+            if idx + 1 == c.ops.len() {
+                self.emit_compare(op.op);
+            } else {
+                self.add(Instruction::CompareAndPreserve(compare_op(op.op)));
+                cleanup_jumps.push(self.add(Instruction::JumpIfFalseOrPop(!0)));
+            }
+        }
+        if !cleanup_jumps.is_empty() {
+            let jump_end = self.add(Instruction::Jump(!0));
+            let cleanup_start = self.next_instruction();
+            self.add(Instruction::Swap);
+            self.add(Instruction::DiscardTop);
+            let end = self.next_instruction();
+            for instr in cleanup_jumps {
+                match self.instructions.get_mut(instr) {
+                    Some(&mut Instruction::JumpIfFalseOrPop(ref mut target)) => {
+                        *target = cleanup_start;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            match self.instructions.get_mut(jump_end) {
+                Some(&mut Instruction::Jump(ref mut target)) => {
+                    *target = end;
+                }
+                _ => unreachable!(),
+            }
+        }
+        self.pop_span();
+    }
+
+    fn emit_compare(&mut self, op: ast::CompareOpKind) {
+        self.add(match op {
+            ast::CompareOpKind::Eq => Instruction::Eq,
+            ast::CompareOpKind::Ne => Instruction::Ne,
+            ast::CompareOpKind::Lt => Instruction::Lt,
+            ast::CompareOpKind::Lte => Instruction::Lte,
+            ast::CompareOpKind::Gt => Instruction::Gt,
+            ast::CompareOpKind::Gte => Instruction::Gte,
+            ast::CompareOpKind::In | ast::CompareOpKind::NotIn => Instruction::In,
+        });
+        if matches!(op, ast::CompareOpKind::NotIn) {
+            self.add(Instruction::Not);
+        }
+    }
+
     fn compile_bin_op(&mut self, c: &ast::Spanned<ast::BinOp<'source>>) {
         self.push_span(c.span());
         let instr = match c.op {
@@ -915,12 +1039,14 @@ impl<'source> CodeGenerator<'source> {
 
     /// Converts the compiler into the instructions.
     pub fn finish(
-        self,
+        mut self,
     ) -> (
         Instructions<'source>,
         BTreeMap<&'source str, Instructions<'source>>,
     ) {
         assert!(self.pending_block.is_empty());
+        recycle_pending_block_buffer(mem::take(&mut self.pending_block));
+        recycle_span_stack_buffer(mem::take(&mut self.span_stack));
         (self.instructions, self.blocks)
     }
 }

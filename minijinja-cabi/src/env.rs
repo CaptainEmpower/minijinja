@@ -1,13 +1,132 @@
-use std::ffi::{c_char, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
+use std::sync::Arc;
 
 use minijinja::syntax::SyntaxConfig;
-use minijinja::{Environment, Error, ErrorKind, UndefinedBehavior};
+use minijinja::value::Rest;
+use minijinja::{AutoEscape, Environment, Error, ErrorKind, UndefinedBehavior, Value};
 
 use crate::mj_value;
 
 /// Pointer to a MiniJinja environment.
 pub struct mj_env(pub(crate) Environment<'static>);
+
+/// Callback used for user data cleanup.
+pub type mj_user_data_free = Option<unsafe extern "C" fn(userdata: *mut c_void)>;
+
+/// Callback used for custom functions, filters and tests.
+///
+/// Returns `true` on success and writes the return value into `rv_out`.
+/// Returns `false` on failure.
+pub type mj_value_callback = Option<
+    unsafe extern "C" fn(
+        userdata: *mut c_void,
+        args: *const mj_value,
+        argc: usize,
+        rv_out: *mut mj_value,
+    ) -> bool,
+>;
+
+/// Callback used for loading template source by name.
+///
+/// Return `NULL` if the template was not found.
+pub type mj_loader_callback =
+    Option<unsafe extern "C" fn(userdata: *mut c_void, name: *const c_char) -> *const c_char>;
+
+/// Callback used to join include paths.
+///
+/// Return `NULL` to indicate an error.
+pub type mj_path_join_callback = Option<
+    unsafe extern "C" fn(
+        userdata: *mut c_void,
+        name: *const c_char,
+        parent: *const c_char,
+    ) -> *const c_char,
+>;
+
+/// Callback used to select auto escaping for a template name.
+pub type mj_auto_escape_callback =
+    Option<unsafe extern "C" fn(userdata: *mut c_void, name: *const c_char) -> mj_auto_escape>;
+
+/// Auto escaping modes for callback-based configuration.
+#[repr(C)]
+pub enum mj_auto_escape {
+    MJ_AUTO_ESCAPE_NONE,
+    MJ_AUTO_ESCAPE_HTML,
+}
+
+struct UserData {
+    userdata: *mut c_void,
+    free_func: mj_user_data_free,
+}
+
+unsafe impl Send for UserData {}
+unsafe impl Sync for UserData {}
+
+impl Drop for UserData {
+    fn drop(&mut self) {
+        if let Some(free_func) = self.free_func {
+            unsafe { free_func(self.userdata) };
+        }
+    }
+}
+
+fn missing_callback(which: &str) -> Error {
+    Error::new(
+        ErrorKind::InvalidOperation,
+        format!("missing {which} callback"),
+    )
+}
+
+fn invalid_callback_result(which: &str) -> Error {
+    Error::new(
+        ErrorKind::InvalidOperation,
+        format!("{which} callback returned invalid utf-8"),
+    )
+}
+
+fn callback_failed(which: &str) -> Error {
+    Error::new(
+        ErrorKind::InvalidOperation,
+        format!("{which} callback failed"),
+    )
+}
+
+fn invoke_value_callback(
+    callback: unsafe extern "C" fn(
+        userdata: *mut c_void,
+        args: *const mj_value,
+        argc: usize,
+        rv_out: *mut mj_value,
+    ) -> bool,
+    userdata: &UserData,
+    args: &[Value],
+    which: &str,
+) -> Result<Value, Error> {
+    let mut c_args = args
+        .iter()
+        .cloned()
+        .map(mj_value::from)
+        .collect::<Vec<mj_value>>();
+    let mut rv = mj_value::from(Value::UNDEFINED);
+
+    let ok = unsafe { callback(userdata.userdata, c_args.as_ptr(), c_args.len(), &mut rv) };
+
+    for arg in &mut c_args {
+        unsafe {
+            crate::mj_value_decref(arg as *mut _);
+        }
+    }
+
+    if ok {
+        Ok(rv.into_value())
+    } else {
+        unsafe {
+            crate::mj_value_decref(&mut rv);
+        }
+        Err(callback_failed(which))
+    }
+}
 
 ffi_fn! {
     /// Allocates a new and empty MiniJinja environment.
@@ -69,6 +188,188 @@ ffi_fn! {
 }
 
 ffi_fn! {
+    /// Adds a global value to the environment.
+    ///
+    /// Takes ownership of the given value.
+    unsafe fn mj_env_add_global(
+        scope,
+        env: *mut mj_env,
+        name: *const c_char,
+        value: mj_value,
+    ) -> bool {
+        let value = value.into_value();
+        (*env).0.add_global(scope.get_str(name)?.to_string(), value);
+        true
+    }
+}
+
+ffi_fn! {
+    /// Registers a C callback as template function.
+    unsafe fn mj_env_add_function(
+        scope,
+        env: *mut mj_env,
+        name: *const c_char,
+        callback: mj_value_callback,
+        userdata: *mut c_void,
+        free_func: mj_user_data_free,
+    ) -> bool {
+        let callback = callback.ok_or_else(|| missing_callback("function"))?;
+        let name = scope.get_str(name)?.to_string();
+        let userdata = Arc::new(UserData { userdata, free_func });
+        (*env).0.add_function(name, {
+            let userdata = userdata.clone();
+            move |args: Rest<Value>| -> Result<Value, Error> {
+                invoke_value_callback(callback, userdata.as_ref(), &args, "function")
+            }
+        });
+        true
+    }
+}
+
+ffi_fn! {
+    /// Registers a C callback as filter.
+    unsafe fn mj_env_add_filter(
+        scope,
+        env: *mut mj_env,
+        name: *const c_char,
+        callback: mj_value_callback,
+        userdata: *mut c_void,
+        free_func: mj_user_data_free,
+    ) -> bool {
+        let callback = callback.ok_or_else(|| missing_callback("filter"))?;
+        let name = scope.get_str(name)?.to_string();
+        let userdata = Arc::new(UserData { userdata, free_func });
+        (*env).0.add_filter(name, {
+            let userdata = userdata.clone();
+            move |args: Rest<Value>| -> Result<Value, Error> {
+                invoke_value_callback(callback, userdata.as_ref(), &args, "filter")
+            }
+        });
+        true
+    }
+}
+
+ffi_fn! {
+    /// Registers a C callback as test.
+    unsafe fn mj_env_add_test(
+        scope,
+        env: *mut mj_env,
+        name: *const c_char,
+        callback: mj_value_callback,
+        userdata: *mut c_void,
+        free_func: mj_user_data_free,
+    ) -> bool {
+        let callback = callback.ok_or_else(|| missing_callback("test"))?;
+        let name = scope.get_str(name)?.to_string();
+        let userdata = Arc::new(UserData { userdata, free_func });
+        (*env).0.add_test(name, {
+            let userdata = userdata.clone();
+            move |args: Rest<Value>| -> Result<Value, Error> {
+                invoke_value_callback(callback, userdata.as_ref(), &args, "test")
+            }
+        });
+        true
+    }
+}
+
+ffi_fn! {
+    /// Configures a callback-based template loader.
+    unsafe fn mj_env_set_loader(
+        _scope,
+        env: *mut mj_env,
+        callback: mj_loader_callback,
+        userdata: *mut c_void,
+        free_func: mj_user_data_free,
+    ) -> bool {
+        let callback = callback.ok_or_else(|| missing_callback("loader"))?;
+        let userdata = Arc::new(UserData { userdata, free_func });
+        (*env).0.set_loader({
+            let userdata = userdata.clone();
+            move |name| {
+                let name = CString::new(name).map_err(|_| callback_failed("loader"))?;
+                let rv = unsafe { callback(userdata.userdata, name.as_ptr()) };
+                if rv.is_null() {
+                    Ok(None)
+                } else {
+                    let source = unsafe { CStr::from_ptr(rv) }
+                        .to_str()
+                        .map_err(|_| invalid_callback_result("loader"))?;
+                    Ok(Some(source.to_string()))
+                }
+            }
+        });
+        true
+    }
+}
+
+ffi_fn! {
+    /// Configures a callback for joining include paths.
+    unsafe fn mj_env_set_path_join_callback(
+        _scope,
+        env: *mut mj_env,
+        callback: mj_path_join_callback,
+        userdata: *mut c_void,
+        free_func: mj_user_data_free,
+    ) -> bool {
+        let callback = callback.ok_or_else(|| missing_callback("path join"))?;
+        let userdata = Arc::new(UserData { userdata, free_func });
+        (*env).0.set_path_join_callback({
+            let userdata = userdata.clone();
+            move |name, parent| -> std::borrow::Cow<'_, str> {
+                let Ok(name_cstr) = CString::new(name) else {
+                    return name.into();
+                };
+                let Ok(parent_cstr) = CString::new(parent) else {
+                    return name.into();
+                };
+
+                let rv = unsafe {
+                    callback(userdata.userdata, name_cstr.as_ptr(), parent_cstr.as_ptr())
+                };
+
+                if rv.is_null() {
+                    name.into()
+                } else {
+                    unsafe { CStr::from_ptr(rv) }
+                        .to_str()
+                        .map_or_else(|_| name.into(), |joined| joined.to_string().into())
+                }
+            }
+        });
+        true
+    }
+}
+
+ffi_fn! {
+    /// Configures a callback for auto escaping.
+    unsafe fn mj_env_set_auto_escape_callback(
+        _scope,
+        env: *mut mj_env,
+        callback: mj_auto_escape_callback,
+        userdata: *mut c_void,
+        free_func: mj_user_data_free,
+    ) -> bool {
+        let callback = callback.ok_or_else(|| missing_callback("auto escape"))?;
+        let userdata = Arc::new(UserData { userdata, free_func });
+        (*env).0.set_auto_escape_callback({
+            let userdata = userdata.clone();
+            move |name| {
+                let rv = if let Ok(name) = CString::new(name) {
+                    unsafe { callback(userdata.userdata, name.as_ptr()) }
+                } else {
+                    unsafe { callback(userdata.userdata, ptr::null()) }
+                };
+                match rv {
+                    mj_auto_escape::MJ_AUTO_ESCAPE_NONE => AutoEscape::None,
+                    mj_auto_escape::MJ_AUTO_ESCAPE_HTML => AutoEscape::Html,
+                }
+            }
+        });
+        true
+    }
+}
+
+ffi_fn! {
     /// Renders a template registered on the environment.
     ///
     /// Takes ownership of the given context.
@@ -78,8 +379,9 @@ ffi_fn! {
         name: *const c_char,
         ctx: mj_value
     ) -> *mut c_char {
+        let ctx = ctx.into_value();
         let t = (*env).0.get_template(scope.get_str(name)?)?;
-        let rv = t.render(ctx.into_value())?;
+        let rv = t.render(ctx)?;
         CString::new(rv).map_err(|_| {
             Error::new(ErrorKind::InvalidOperation, "template rendered null bytes")
         })?.into_raw()
@@ -97,10 +399,11 @@ ffi_fn! {
         source: *const c_char,
         ctx: mj_value
     ) -> *mut c_char {
+        let ctx = ctx.into_value();
         let rv = (*env).0.render_named_str(
             scope.get_str(name)?,
             scope.get_str(source)?,
-            ctx.into_value()
+            ctx
         )?;
         CString::new(rv).map_err(|_| {
             Error::new(ErrorKind::InvalidOperation, "template rendered null bytes")
@@ -116,8 +419,9 @@ ffi_fn! {
         expr: *const c_char,
         ctx: mj_value
     ) -> mj_value {
+        let ctx = ctx.into_value();
         let expr = (*env).0.compile_expression(scope.get_str(expr)?)?;
-        expr.eval(ctx.into_value())?.into()
+        expr.eval(ctx)?.into()
     }
 }
 
@@ -151,6 +455,20 @@ ffi_fn! {
     }
 }
 
+ffi_fn! {
+    /// Sets the fuel budget for expression evaluation and rendering.
+    unsafe fn mj_env_set_fuel(_scope, env: *mut mj_env, fuel: u64) {
+        (*env).0.set_fuel(Some(fuel));
+    }
+}
+
+ffi_fn! {
+    /// Clears the fuel budget.
+    unsafe fn mj_env_clear_fuel(_scope, env: *mut mj_env) {
+        (*env).0.set_fuel(None);
+    }
+}
+
 /// Allows one to override the syntax elements.
 #[repr(C)]
 pub struct mj_syntax_config {
@@ -162,6 +480,18 @@ pub struct mj_syntax_config {
     comment_end: *const c_char,
     line_statement_prefix: *const c_char,
     line_comment_prefix: *const c_char,
+}
+
+const DEFAULT_BLOCK_START: &[u8] = b"{%\0";
+const DEFAULT_BLOCK_END: &[u8] = b"%}\0";
+const DEFAULT_VARIABLE_START: &[u8] = b"{{\0";
+const DEFAULT_VARIABLE_END: &[u8] = b"}}\0";
+const DEFAULT_COMMENT_START: &[u8] = b"{#\0";
+const DEFAULT_COMMENT_END: &[u8] = b"#}\0";
+
+#[inline]
+const fn c_char_ptr(bytes: &'static [u8]) -> *const c_char {
+    bytes.as_ptr() as *const c_char
 }
 
 ffi_fn! {
@@ -197,12 +527,12 @@ ffi_fn! {
 ffi_fn! {
     /// Sets the syntax to defaults.
     unsafe fn mj_syntax_config_default(_scope, syntax: &mut mj_syntax_config) {
-        syntax.block_start = "{%".as_ptr() as *const _;
-        syntax.block_end = "%}".as_ptr() as *const _;
-        syntax.variable_start = "{{".as_ptr() as *const _;
-        syntax.variable_end = "}}".as_ptr() as *const _;
-        syntax.comment_start = "{#".as_ptr() as *const _;
-        syntax.comment_end = "#}".as_ptr() as *const _;
+        syntax.block_start = c_char_ptr(DEFAULT_BLOCK_START);
+        syntax.block_end = c_char_ptr(DEFAULT_BLOCK_END);
+        syntax.variable_start = c_char_ptr(DEFAULT_VARIABLE_START);
+        syntax.variable_end = c_char_ptr(DEFAULT_VARIABLE_END);
+        syntax.comment_start = c_char_ptr(DEFAULT_COMMENT_START);
+        syntax.comment_end = c_char_ptr(DEFAULT_COMMENT_END);
         syntax.line_statement_prefix = ptr::null();
         syntax.line_comment_prefix = ptr::null();
     }

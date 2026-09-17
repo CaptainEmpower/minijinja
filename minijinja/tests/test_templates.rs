@@ -1,3 +1,6 @@
+// The Unicode lookup test intentionally uses Greek alpha, which is visually
+// confusable with an ASCII identifier elsewhere in this test crate.
+#![allow(confusable_idents, mixed_script_confusables)]
 #![cfg(all(
     feature = "multi_template",
     feature = "macros",
@@ -8,8 +11,8 @@
 ))]
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::fs;
 use std::sync::Arc;
-use std::{env, fs};
 
 use insta::assert_snapshot;
 use minijinja::syntax::SyntaxConfig;
@@ -175,8 +178,8 @@ fn test_vm_block_fragments() {
             let template = env.get_template(filename).unwrap();
 
             match template
-                .eval_to_state(&ctx)
-                .and_then(|mut x| x.render_block("fragment"))
+                .render_captured(&ctx)
+                .and_then(|mut x| x.with_state_mut(|state| state.render_block("fragment")))
             {
                 Ok(mut rendered) => {
                     rendered.push('\n');
@@ -223,6 +226,92 @@ fn test_custom_filter() {
     let tmpl = env.get_template("test").unwrap();
     let rv = tmpl.render(&ctx).unwrap();
     assert_eq!(rv, "[42]");
+}
+
+#[test]
+fn test_dotted_integer_lookup() {
+    assert_eq!(render!("{{ [1, 2].0 }}"), "1");
+    assert_eq!(render!("{{ [1, 2].1 }}"), "2");
+}
+
+#[test]
+fn test_chained_comparisons() {
+    assert_eq!(
+        render!("{{ x not in y != z }}", x => "foo", y => "bar", z => "foo"),
+        "True"
+    );
+    assert_eq!(
+        render!("{{ x not in y != y }}", x => "foo", y => "bar"),
+        "False"
+    );
+    assert_eq!(
+        render!("{{ lhs != rhs != lhs }}", lhs => 1, rhs => 2),
+        "True"
+    );
+    assert_eq!(
+        render!("{{ needle in haystack in seq }}", needle => "o", haystack => "foo", seq => vec!["foo"]),
+        "True"
+    );
+    assert_eq!(
+        render!("{{ needle in haystack == true }}", needle => "f", haystack => "foo"),
+        "False"
+    );
+
+    fn inc(state: &State) -> Value {
+        let old = state
+            .get_temp("chained_comparison_counter")
+            .unwrap_or_else(|| Value::from(0i64));
+        let new = Value::from(i64::try_from(old).unwrap() + 1);
+        state.set_temp("chained_comparison_counter", new.clone());
+        new
+    }
+
+    let mut env = Environment::new();
+    env.add_function("inc", inc);
+    assert_eq!(env.render_str("{{ 0 < inc() < 2 }}", ()).unwrap(), "True");
+    assert_eq!(
+        env.render_str("{{ 2 < inc() < fail() }}", ()).unwrap(),
+        "False"
+    );
+}
+
+#[test]
+fn test_dotted_integer_lookup_midchain() {
+    assert_eq!(
+        render!("{{ msgs.0.role }}", msgs => vec![context!(role => "user")]),
+        "user"
+    );
+    assert_eq!(
+        render!("{{ rows.10.name }}",
+                rows => (0..=10).map(|i| context!(name => format!("r{i}")))
+                                .collect::<Vec<_>>()),
+        "r10"
+    );
+    assert_eq!(
+        render!("{{ rows.1_000.name }}",
+                rows => vec![context!(name => "r1000"); 1001]),
+        "r1000"
+    );
+    assert_eq!(
+        render!("{{ data.0._meta }}", data => vec![context!(_meta => "x")]),
+        "x"
+    );
+
+    assert_eq!(render!("{{ 1.0 + 0 }}"), "1.0");
+    assert_eq!(render!("{{ 42. + 0 }}"), "42.0");
+    assert_eq!(render!("{{ 1.e5 }}"), "100000.0");
+    assert_eq!(render!("{{ 1.E5 }}"), "100000.0");
+    assert_eq!(render!("{{ 1.e+5 }}"), "100000.0");
+    assert_eq!(render!("{{ 1.E-3 }}"), "0.001");
+}
+
+#[test]
+#[cfg(feature = "unicode")]
+fn test_dotted_integer_lookup_midchain_unicode() {
+    assert_eq!(
+        render!("{{ data.0.α }}", data => vec![context!(α => "ok")]),
+        "ok"
+    );
 }
 
 #[test]
@@ -575,7 +664,11 @@ fn test_block_fragments() {
     let tmpl = env.get_template("demo").unwrap();
 
     let rv_a = tmpl.render(()).unwrap();
-    let rv_b = tmpl.eval_to_state(()).unwrap().render_block("foo").unwrap();
+    let rv_b = tmpl
+        .render_captured(())
+        .unwrap()
+        .with_state_mut(|state| state.render_block("foo"))
+        .unwrap();
 
     assert_eq!(rv_a, "I am outside the fragmentfooSo am I!");
     assert_eq!(rv_b, "foo");
@@ -594,20 +687,22 @@ fn test_state() {
     )
     .unwrap();
     let template = env.get_template("foo.html").unwrap();
-    let mut state = template
-        .eval_to_state(context! {
+    let mut rendered = template
+        .render_captured(context! {
             variable => 23
         })
         .unwrap();
-    assert!(state.lookup("range").is_some());
-    assert!(!state.exports().contains(&"range"));
-    assert_eq!(state.lookup("global"), Some(Value::from(23 * 2)));
-    assert_eq!(state.call_macro("something", &[]).unwrap(), "46");
-    assert_eq!(state.render_block("baz").unwrap(), "[46]");
+    assert!(rendered.state().lookup("range").is_some());
+    assert!(!rendered.state().exports().contains(&"range"));
+    assert_eq!(rendered.state().lookup("global"), Some(Value::from(23 * 2)));
+    rendered.with_state_mut(|state| {
+        assert_eq!(state.call_macro("something", &[]).unwrap(), "46");
+        assert_eq!(state.render_block("baz").unwrap(), "[46]");
+    });
 }
 
 #[test]
-#[allow(unused_mut)]
+#[allow(unused_mut, deprecated)]
 fn test_render_and_return_state() {
     let mut env = Environment::new();
     #[cfg(feature = "fuel")]
@@ -630,16 +725,60 @@ fn test_render_and_return_state() {
 }
 
 #[test]
-fn test_render_to_write_state() {
+fn test_loop_locals_do_not_persist_between_iterations() {
+    assert_eq!(
+        render!("{% for x in [1, 2] %}{% if loop.first %}{% set y = x %}{% endif %}[{{ y }}]{% endfor %}"),
+        "[1][]"
+    );
+}
+
+#[test]
+fn test_render_captured() {
+    let env = Environment::new();
+    let rendered = env
+        .template_from_str("{% set foo = 42 %}{% macro bar() %}x{{ foo }}{% endmacro %}")
+        .unwrap()
+        .render_captured(())
+        .unwrap();
+    assert_eq!(rendered.output(), "");
+    assert_eq!(rendered.state().lookup("foo"), Some(Value::from(42)));
+    assert_eq!(
+        rendered.state().call_macro("bar", &[]).ok().as_deref(),
+        Some("x42")
+    );
+}
+
+#[test]
+fn test_render_captured_to() {
     let env = Environment::new();
     let tmpl = env
         .template_from_str("{% set foo = 42 %}{% macro bar() %}x{% endmacro %}root")
         .unwrap();
     let mut out = Vec::<u8>::new();
-    let state = tmpl.render_to_write((), &mut out).unwrap();
+    let captured = tmpl.render_captured_to((), &mut out).unwrap();
     assert_eq!(String::from_utf8_lossy(&out), "root");
-    assert_eq!(state.lookup("foo"), Some(Value::from(42)));
-    assert_eq!(state.call_macro("bar", &[]).ok().as_deref(), Some("x"));
+    assert_eq!(captured.output(), "");
+    assert_eq!(captured.state().lookup("foo"), Some(Value::from(42)));
+    assert_eq!(
+        captured.state().call_macro("bar", &[]).ok().as_deref(),
+        Some("x")
+    );
+}
+
+#[test]
+fn test_primitive_rendering() {
+    assert_eq!(
+        render!("{{ none }}|{{ true }}|{{ false }}"),
+        "None|True|False"
+    );
+    assert_eq!(render!("{{ [none, true, false] }}"), "[None, True, False]");
+
+    let mut env = Environment::new();
+    env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
+    assert_eq!(
+        render!(in env, "{{ none }}|{{ true }}|{{ false }}"),
+        "None|True|False"
+    );
 }
 
 #[test]
@@ -649,8 +788,12 @@ fn test_functions() {
         @"42"
     );
     assert_snapshot!(
+        render!("{{ {'f': f}.f() }}", f => Value::from_function(|| -> i32 { 42 })),
+        @"42"
+    );
+    assert_snapshot!(
         render!("{{ f() }}", f => Value::from_function(|| -> Option<i32> { None })),
-        @"none"
+        @"None"
     );
     assert_snapshot!(
         render!("{{ f() }}", f => Value::from_function(|| -> Result<i32, Error> { Ok(23) })),
@@ -682,7 +825,7 @@ fn test_invalid_value_iteration() {
         .template_from_str("{% for item in iter %}[{{ item }}]{% endfor %}")
         .unwrap();
     let err = t
-        .render_to_write(
+        .render_captured_to(
             context! { iter => Value::from_object(FailingIteration) },
             &mut out,
         )
@@ -738,5 +881,5 @@ fn test_test_caching() {
     )
     .unwrap();
     let rv = env.get_template("child.txt").unwrap().render(()).unwrap();
-    assert_eq!(rv, "false");
+    assert_eq!(rv, "False");
 }

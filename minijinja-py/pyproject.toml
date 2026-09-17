@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "minijinja"
-version = "2.14.0"
+version = "2.24.0"
 description = "An experimental Python binding of the Rust MiniJinja template engine."
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
@@ -23,6 +23,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Topic :: Text Processing :: Markup :: HTML",
     "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Typing :: Typed",
 ]
 
 [project.urls]
@@ -33,7 +34,6 @@ Repository = "https://github.com/mitsuhiko/minijinja"
 [tool.maturin]
 module-name = "minijinja._lowlevel"
 python-source = "python"
-strip = true
 
 [tool.pyright]
 include = ["python/**/*.pyi"]
