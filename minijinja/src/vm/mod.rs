@@ -198,7 +198,9 @@ impl<'env> Vm<'env> {
         let undefined_behavior = state.undefined_behavior();
         let strict_undefined = matches!(
             undefined_behavior,
-            UndefinedBehavior::Strict | UndefinedBehavior::SemiStrict
+            UndefinedBehavior::Strict
+                | UndefinedBehavior::SemiStrict
+                | UndefinedBehavior::StrictChainable
         );
         let mut auto_escape_stack = vec![];
         let mut next_loop_recursion_jump = None;
@@ -390,7 +392,12 @@ impl<'env> Vm<'env> {
                     let stop = stack.pop();
                     b = stack.pop();
                     a = stack.pop();
-                    if a.is_undefined() && matches!(undefined_behavior, UndefinedBehavior::Strict) {
+                    if a.is_undefined()
+                        && matches!(
+                            undefined_behavior,
+                            UndefinedBehavior::Strict | UndefinedBehavior::StrictChainable
+                        )
+                    {
                         bail!(Error::from(ErrorKind::UndefinedError));
                     }
                     stack.push(ctx_ok!(ops::slice(a, b, stop, step)));
