@@ -876,7 +876,9 @@ impl<'source> Environment<'source> {
             // exclusively used in the missing else condition of an if expression to match
             // Jinja2 behavior.  Those go straight to the formatter.
             (
-                UndefinedBehavior::Strict | UndefinedBehavior::SemiStrict,
+                UndefinedBehavior::Strict
+                | UndefinedBehavior::SemiStrict
+                | UndefinedBehavior::StrictChainable,
                 &ValueRepr::Undefined(UndefinedType::Default),
             ) => Err(Error::from(ErrorKind::UndefinedError)),
             _ => {

@@ -67,6 +67,10 @@ typedef enum mj_undefined_behavior {
    Like Lenient, but also allows chaining of undefined lookups.
    */
   MJ_UNDEFINED_BEHAVIOR_CHAINABLE,
+  /*
+   Like Strict, but also allows chaining of undefined lookups.
+   */
+  MJ_UNDEFINED_BEHAVIOR_STRICT_CHAINABLE,
 } mj_undefined_behavior;
 
 /*

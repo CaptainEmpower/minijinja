@@ -547,6 +547,8 @@ pub enum mj_undefined_behavior {
     MJ_UNDEFINED_BEHAVIOR_STRICT,
     /// Like Lenient, but also allows chaining of undefined lookups.
     MJ_UNDEFINED_BEHAVIOR_CHAINABLE,
+    /// Like Strict, but also allows chaining of undefined lookups.
+    MJ_UNDEFINED_BEHAVIOR_STRICT_CHAINABLE,
 }
 
 ffi_fn! {
@@ -556,6 +558,9 @@ ffi_fn! {
             mj_undefined_behavior::MJ_UNDEFINED_BEHAVIOR_LENIENT => UndefinedBehavior::Lenient,
             mj_undefined_behavior::MJ_UNDEFINED_BEHAVIOR_STRICT => UndefinedBehavior::Strict,
             mj_undefined_behavior::MJ_UNDEFINED_BEHAVIOR_CHAINABLE => UndefinedBehavior::Chainable,
+            mj_undefined_behavior::MJ_UNDEFINED_BEHAVIOR_STRICT_CHAINABLE => {
+                UndefinedBehavior::StrictChainable
+            }
         })
     }
 }

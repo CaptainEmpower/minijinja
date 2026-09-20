@@ -185,9 +185,9 @@ pub enum AutoEscape {
 
 /// Defines the behavior of undefined values in the engine.
 ///
-/// At present there are three types of behaviors available which mirror the
-/// behaviors that Jinja2 provides out of the box and an extra option called
-/// `SemiStrict` which is a slightly less strict undefined.
+/// These mirror the behaviors Jinja2 provides out of the box, plus
+/// `SemiStrict` (a slightly less strict undefined) and `StrictChainable`
+/// (a strict undefined that may still be chained).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum UndefinedBehavior {
@@ -222,6 +222,28 @@ pub enum UndefinedBehavior {
     /// * **string coercion in filters/functions:** fails
     /// * **if true:** fails
     Strict,
+    /// Like `Strict`, but allows chaining of undefined lookups.
+    ///
+    /// * **printing:** fails
+    /// * **iteration:** fails
+    /// * **attribute access of undefined values:** allowed (returns [`undefined`](Value::UNDEFINED))
+    /// * **string coercion in filters/functions:** fails
+    /// * **if true:** fails
+    ///
+    /// This is the combination Jinja2 produces by composing
+    /// `ChainableUndefined` with `StrictUndefined`, and neither `Chainable`
+    /// nor `Strict` gives it on its own: `Chainable` relaxes *printing*,
+    /// *iteration* and *truthiness* along with attribute access, and `Strict`
+    /// refuses all four.
+    ///
+    /// The distinction matters wherever a template defends itself with
+    /// `default`. Under `Chainable`, `{{ a.b | default('x') }}` resolves --
+    /// and so does `{{ typo }}`, to the empty string, and
+    /// `{% for i in typo %}`, to nothing at all. Under `Strict` the first
+    /// fails with the other two. `StrictChainable` resolves the first and
+    /// still fails the rest, so a template can reach through a value that may
+    /// be absent without a misspelling anywhere else in it going quiet.
+    StrictChainable,
 }
 
 impl UndefinedBehavior {
@@ -235,7 +257,8 @@ impl UndefinedBehavior {
             (UndefinedBehavior::Lenient, false)
             | (UndefinedBehavior::Strict, false)
             | (UndefinedBehavior::SemiStrict, false)
-            | (UndefinedBehavior::Chainable, _) => Ok(Value::UNDEFINED),
+            | (UndefinedBehavior::Chainable, _)
+            | (UndefinedBehavior::StrictChainable, _) => Ok(Value::UNDEFINED),
             (UndefinedBehavior::Lenient, true)
             | (UndefinedBehavior::Strict, true)
             | (UndefinedBehavior::SemiStrict, true) => Err(Error::from(ErrorKind::UndefinedError)),
@@ -249,9 +272,10 @@ impl UndefinedBehavior {
     pub(crate) fn is_true(self, value: &Value) -> Result<bool, Error> {
         match (self, &value.0) {
             // silent undefined doesn't error, even in strict mode
-            (UndefinedBehavior::Strict, &ValueRepr::Undefined(UndefinedType::Default)) => {
-                Err(Error::from(ErrorKind::UndefinedError))
-            }
+            (
+                UndefinedBehavior::Strict | UndefinedBehavior::StrictChainable,
+                &ValueRepr::Undefined(UndefinedType::Default),
+            ) => Err(Error::from(ErrorKind::UndefinedError)),
             _ => Ok(value.is_true()),
         }
     }
@@ -272,7 +296,9 @@ impl UndefinedBehavior {
         match (self, &value.0) {
             // silent undefined doesn't error, even in strict mode
             (
-                UndefinedBehavior::Strict | UndefinedBehavior::SemiStrict,
+                UndefinedBehavior::Strict
+                | UndefinedBehavior::SemiStrict
+                | UndefinedBehavior::StrictChainable,
                 &ValueRepr::Undefined(UndefinedType::Default),
             ) => Err(Error::from(ErrorKind::UndefinedError)),
             _ => Ok(()),
@@ -290,7 +316,9 @@ impl UndefinedBehavior {
         match (self, &value.0) {
             // silent undefined never errors
             (
-                UndefinedBehavior::Strict | UndefinedBehavior::SemiStrict,
+                UndefinedBehavior::Strict
+                | UndefinedBehavior::SemiStrict
+                | UndefinedBehavior::StrictChainable,
                 &ValueRepr::Undefined(UndefinedType::Default),
             ) => Err(Error::from(ErrorKind::UndefinedError)),
             _ => Ok(()),

@@ -32,7 +32,7 @@ class _PassesState(Protocol[_A_contra, _R_co]):
     __minijinja_pass_state__: Literal[True]
 
 _StrPath: TypeAlias = PurePath | str
-_Behavior = Literal["strict", "lenient", "chainable"]
+_Behavior = Literal["strict", "lenient", "chainable", "semi_strict", "strict_chainable"]
 
 DEFAULT_ENVIRONMENT: Final[Environment]
 
