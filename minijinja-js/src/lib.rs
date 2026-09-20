@@ -245,6 +245,7 @@ pub enum UndefinedBehavior {
     Chainable = "chainable",
     Lenient = "lenient",
     SemiStrict = "semi_strct",
+    StrictChainable = "strict_chainable",
 }
 
 impl From<mj::UndefinedBehavior> for UndefinedBehavior {
@@ -254,6 +255,7 @@ impl From<mj::UndefinedBehavior> for UndefinedBehavior {
             mj::UndefinedBehavior::Chainable => UndefinedBehavior::Chainable,
             mj::UndefinedBehavior::Lenient => UndefinedBehavior::Lenient,
             mj::UndefinedBehavior::SemiStrict => UndefinedBehavior::SemiStrict,
+            mj::UndefinedBehavior::StrictChainable => UndefinedBehavior::StrictChainable,
             _ => unreachable!(),
         }
     }
@@ -266,6 +268,7 @@ impl From<UndefinedBehavior> for mj::UndefinedBehavior {
             UndefinedBehavior::Chainable => mj::UndefinedBehavior::Chainable,
             UndefinedBehavior::Lenient => mj::UndefinedBehavior::Lenient,
             UndefinedBehavior::SemiStrict => mj::UndefinedBehavior::SemiStrict,
+            UndefinedBehavior::StrictChainable => mj::UndefinedBehavior::StrictChainable,
             _ => unreachable!(),
         }
     }
