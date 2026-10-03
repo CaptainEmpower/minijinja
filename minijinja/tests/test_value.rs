@@ -1283,3 +1283,37 @@ fn test_custom_object_compare() {
     let rv = render!("{{ seq|sort|join('|') }}", seq);
     assert_eq!(rv, "0|1|2|3|4");
 }
+
+/// A float renders as Python's `str()` renders it, which is what Jinja2
+/// prints: expected values are CPython's `str(float)`.
+#[test]
+fn test_float_display_is_pythons_str() {
+    let cases: &[(f64, &str)] = &[
+        (2.0, "2.0"),
+        (0.5, "0.5"),
+        (-0.0, "-0.0"),
+        (0.0001, "0.0001"),
+        (0.00001, "1e-05"),
+        (1e15, "1000000000000000.0"),
+        (1e16, "1e+16"),
+        (1.5e300, "1.5e+300"),
+        (123456789012345678.0, "1.2345678901234568e+17"),
+        (f64::NAN, "nan"),
+        (f64::INFINITY, "inf"),
+        (f64::NEG_INFINITY, "-inf"),
+    ];
+    for (float, expected) in cases {
+        assert_eq!(Value::from(*float).to_string(), *expected, "{float:e}");
+    }
+}
+
+/// Concatenation formats through the same `Display`, so `~` agrees with
+/// `{{ }}` -- before, `'x' ~ 1e16` wrote every digit.
+#[test]
+fn test_float_concat_is_pythons_str() {
+    let env = Environment::new();
+    let rendered = env
+        .render_str("{{ 'x' ~ 1e16 }} {{ 'x' ~ 2.0 }} {{ 1e-5 }}", ())
+        .unwrap();
+    assert_eq!(rendered, "x1e+16 x2.0 1e-05");
+}

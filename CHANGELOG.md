@@ -4,6 +4,8 @@ All notable changes to MiniJinja are documented here.
 
 ## Unreleased
 
+* Floats now render as Python's `str()` does, for Jinja2 compatibility: `nan` instead of `NaN`, and exponent notation outside `1e-4..1e16` (`1e+16`, `1e-05`) instead of every digit.
+
 ## 2.24.0
 
 * Added the `wordwrap` filter to the Python bindings.  #885
