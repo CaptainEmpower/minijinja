@@ -517,6 +517,11 @@ impl<'env> Vm<'env> {
                     // we are in strict mode.
                     ctx_ok!(state.undefined_behavior().assert_iterable(&a));
                     ctx_ok!(state.undefined_behavior().assert_value_not_undefined(&b));
+                    if raise_on_use {
+                        if let Some(invalid) = invalid_compared(&a, &b) {
+                            bail!(invalid.validate().unwrap_err());
+                        }
+                    }
                     stack.push(ctx_ok!(ops::contains(&a, &b)));
                 }
                 Instruction::CompareAndPreserve(op) => {
@@ -557,6 +562,11 @@ impl<'env> Vm<'env> {
                         CompareOp::In | CompareOp::NotIn => {
                             ctx_ok!(undefined_behavior.assert_iterable(&b));
                             ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
+                            if raise_on_use {
+                                if let Some(invalid) = invalid_compared(&b, &a) {
+                                    bail!(invalid.validate().unwrap_err());
+                                }
+                            }
                             let contains = ctx_ok!(ops::contains(&b, &a)).is_true();
                             if matches!(op, CompareOp::NotIn) {
                                 !contains
@@ -1212,6 +1222,31 @@ impl<'env> Vm<'env> {
             caller_reference: (flags & MACRO_CALLER) != 0,
         }));
     }
+}
+
+/// The first invalid item a containment check over a sequence compares the
+/// needle with, if it reaches one before a match.
+///
+/// Comparing with a value uses it, so with `raise_on_use` an invalid item
+/// raises -- but only one the check reaches: the items are compared in order,
+/// and a match before it ends the check. A mapping is checked by its keys, and
+/// a string by its text, so neither reads an invalid value.
+fn invalid_compared(container: &Value, needle: &Value) -> Option<Value> {
+    if !matches!(
+        container.kind(),
+        crate::value::ValueKind::Seq | crate::value::ValueKind::Iterable
+    ) {
+        return None;
+    }
+    for item in container.try_iter().ok()? {
+        if let ValueRepr::Invalid(_) = item.0 {
+            return Some(item);
+        }
+        if &item == needle {
+            return None;
+        }
+    }
+    None
 }
 
 #[inline(never)]

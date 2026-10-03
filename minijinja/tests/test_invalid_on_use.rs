@@ -64,6 +64,8 @@ fn on_use_using_one_raises() {
         "{{ secret ~ 'a' }}",
         "{{ secret in [1] }}",
         "{{ 1 in secret }}",
+        "{{ 1 in [secret] }}",
+        "{{ 1 not in [2, secret] }}",
         "{{ 'y' if secret else 'n' }}",
         "{{ secret and 1 }}",
         "{{ secret or 1 }}",
@@ -79,6 +81,15 @@ fn on_use_using_one_raises() {
     ] {
         assert!(failed(render(&env, source)), "{source} should raise");
     }
+}
+
+/// A containment check compares in order, so a match before the invalid item
+/// ends it, and a mapping is checked by its keys.
+#[test]
+fn on_use_a_containment_check_uses_only_what_it_compares() {
+    let env = on_use();
+    assert_eq!(render(&env, "{{ 1 in [1, secret] }}").unwrap(), "True");
+    assert_eq!(render(&env, "{{ 'a' in {'a': secret} }}").unwrap(), "True");
 }
 
 #[test]
