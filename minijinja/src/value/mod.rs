@@ -794,19 +794,7 @@ impl fmt::Display for Value {
             ValueRepr::Bool(val) => f.write_str(if val { "True" } else { "False" }),
             ValueRepr::U64(val) => val.fmt(f),
             ValueRepr::I64(val) => val.fmt(f),
-            ValueRepr::F64(val) => {
-                if val.is_nan() {
-                    f.write_str("NaN")
-                } else if val.is_infinite() {
-                    write!(f, "{}inf", if val.is_sign_negative() { "-" } else { "" })
-                } else {
-                    let mut num = val.to_string();
-                    if !num.contains('.') {
-                        num.push_str(".0");
-                    }
-                    write!(f, "{num}")
-                }
-            }
+            ValueRepr::F64(val) => write_python_float(f, val),
             ValueRepr::None => f.write_str("None"),
             ValueRepr::Invalid(ref val) => write!(f, "<invalid value: {val}>"),
             ValueRepr::I128(val) => write!(f, "{}", { val.0 }),
@@ -816,6 +804,45 @@ impl fmt::Display for Value {
             ValueRepr::U128(val) => write!(f, "{}", { val.0 }),
             ValueRepr::Object(ref x) => write!(f, "{x}"),
         }
+    }
+}
+
+/// Writes a float the way Python's `str()` does, which is what Jinja2 prints.
+///
+/// Python keeps a `.0` on a whole float, switches to exponent notation when the
+/// decimal exponent is below -4 or at least 16 (with a signed exponent of at
+/// least two digits), and spells the non-finite values `nan`, `inf` and
+/// `-inf`:
+///
+/// ```text
+/// 2.0  0.0001  1e-05  1e+16  1.5e+300  nan  inf
+/// ```
+///
+/// Rust's own formatting never switches to exponent form, so `1e16` used to
+/// render as `10000000000000000.0` and `1e100` as 101 digits.
+fn write_python_float(f: &mut fmt::Formatter<'_>, val: f64) -> fmt::Result {
+    if val.is_nan() {
+        return f.write_str("nan");
+    }
+    if val.is_infinite() {
+        return f.write_str(if val < 0.0 { "-inf" } else { "inf" });
+    }
+    // `{:e}` is the shortest round-trip mantissa with the decimal exponent
+    // exposed, which is all the threshold needs.
+    let scientific = format!("{val:e}");
+    let mut parts = scientific.splitn(2, 'e');
+    let mantissa = parts.next().unwrap_or_default();
+    let exponent: i32 = parts.next().and_then(|exp| exp.parse().ok()).unwrap_or(0);
+    if (-4..16).contains(&exponent) {
+        let positional = val.to_string();
+        if positional.contains('.') {
+            f.write_str(&positional)
+        } else {
+            write!(f, "{positional}.0")
+        }
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        write!(f, "{mantissa}e{sign}{:02}", exponent.abs())
     }
 }
 
