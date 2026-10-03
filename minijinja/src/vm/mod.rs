@@ -408,7 +408,9 @@ impl<'env> Vm<'env> {
                 Instruction::GetItem => {
                     a = stack.pop();
                     b = stack.pop();
-                    assert_usable!(b);
+                    // The key is compared with the container's keys, so it is
+                    // used as surely as the container is.
+                    assert_usable!(a, b);
                     stack.push(match b.get_item_opt(&a) {
                         Some(value) => assert_valid!(value),
                         None => ctx_ok!(undefined_behavior.handle_undefined(b.is_undefined())),
@@ -419,7 +421,7 @@ impl<'env> Vm<'env> {
                     let stop = stack.pop();
                     b = stack.pop();
                     a = stack.pop();
-                    assert_usable!(a);
+                    assert_usable!(a, b, stop, step);
                     if a.is_undefined()
                         && matches!(
                             undefined_behavior,
@@ -517,12 +519,7 @@ impl<'env> Vm<'env> {
                     // we are in strict mode.
                     ctx_ok!(state.undefined_behavior().assert_iterable(&a));
                     ctx_ok!(state.undefined_behavior().assert_value_not_undefined(&b));
-                    if raise_on_use {
-                        if let Some(invalid) = invalid_compared(&a, &b) {
-                            bail!(invalid.validate().unwrap_err());
-                        }
-                    }
-                    stack.push(ctx_ok!(ops::contains(&a, &b)));
+                    stack.push(ctx_ok!(contains(&a, &b, raise_on_use)));
                 }
                 Instruction::CompareAndPreserve(op) => {
                     b = stack.pop();
@@ -562,12 +559,7 @@ impl<'env> Vm<'env> {
                         CompareOp::In | CompareOp::NotIn => {
                             ctx_ok!(undefined_behavior.assert_iterable(&b));
                             ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
-                            if raise_on_use {
-                                if let Some(invalid) = invalid_compared(&b, &a) {
-                                    bail!(invalid.validate().unwrap_err());
-                                }
-                            }
-                            let contains = ctx_ok!(ops::contains(&b, &a)).is_true();
+                            let contains = ctx_ok!(contains(&b, &a, raise_on_use)).is_true();
                             if matches!(op, CompareOp::NotIn) {
                                 !contains
                             } else {
@@ -655,6 +647,9 @@ impl<'env> Vm<'env> {
                 }
                 Instruction::PushAutoEscape => {
                     a = stack.pop();
+                    // An invalid value has no string to name a mode by, and
+                    // reading it as none would turn escaping off.
+                    assert_usable!(a);
                     auto_escape_stack.push(state.auto_escape.get());
                     state
                         .auto_escape
@@ -781,7 +776,10 @@ impl<'env> Vm<'env> {
                     let args = stack.get_call_args(*arg_count);
                     let arg_count = args.len();
                     assert_usable!(args[0]);
-                    a = ctx_ok!(args[0].call(state, &args[1..]));
+                    a = match ctx_ok!(state.env().guard_call(state, CallKind::Object, "", args)) {
+                        Some(rv) => rv,
+                        None => ctx_ok!(args[0].call(state, &args[1..])),
+                    };
                     stack.drop_top(arg_count);
                     stack.push(a);
                 }
@@ -1224,29 +1222,30 @@ impl<'env> Vm<'env> {
     }
 }
 
-/// The first invalid item a containment check over a sequence compares the
-/// needle with, if it reaches one before a match.
+/// Whether `container` holds `needle`, as the `in` operator asks it.
 ///
-/// Comparing with a value uses it, so with `raise_on_use` an invalid item
-/// raises -- but only one the check reaches: the items are compared in order,
-/// and a match before it ends the check. A mapping is checked by its keys, and
-/// a string by its text, so neither reads an invalid value.
-fn invalid_compared(container: &Value, needle: &Value) -> Option<Value> {
-    if !matches!(
-        container.kind(),
-        crate::value::ValueKind::Seq | crate::value::ValueKind::Iterable
-    ) {
-        return None;
-    }
-    for item in container.try_iter().ok()? {
-        if let ValueRepr::Invalid(_) = item.0 {
-            return Some(item);
+/// Comparing with a value uses it, so with `raise_on_use` an invalid item of a
+/// sequence raises -- but only one the check reaches: the items are compared
+/// in order, in one pass, and a match before it ends the check. A mapping is
+/// checked by its keys, and a string by its text, so neither reads an invalid
+/// value. One pass matters: an iterable may yield its items only once.
+fn contains(container: &Value, needle: &Value, raise_on_use: bool) -> Result<Value, Error> {
+    if raise_on_use {
+        if let ValueRepr::Object(ref obj) = container.0 {
+            if matches!(obj.repr(), ObjectRepr::Seq | ObjectRepr::Iterable) {
+                for item in obj.try_iter().into_iter().flatten() {
+                    if let ValueRepr::Invalid(_) = item.0 {
+                        return Err(item.validate().unwrap_err());
+                    }
+                    if &item == needle {
+                        return Ok(Value::from(true));
+                    }
+                }
+                return Ok(Value::from(false));
+            }
         }
-        if &item == needle {
-            return None;
-        }
     }
-    None
+    ops::contains(container, needle)
 }
 
 #[inline(never)]

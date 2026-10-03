@@ -37,6 +37,9 @@ pub enum CallKind {
     Function,
     /// A method, `value.name(...)`. The receiver is the first argument.
     Method,
+    /// A call of a value that has no name to call it by, `(expr)(...)`. The
+    /// name is empty and the callee is the first argument.
+    Object,
 }
 type PathJoinFunc = dyn for<'s> Fn(&'s str, &'s str) -> Cow<'s, str> + Sync + Send;
 type UnknownMethodFunc =
@@ -655,7 +658,10 @@ impl<'source> Environment<'source> {
     /// then yields `value` itself rather than a boolean -- or an error to fail
     /// the call. It is consulted for calls a template makes and for calls made
     /// through [`State::apply_filter`] and [`State::perform_test`], so a
-    /// filter applying another (`map`) is guarded the same way.
+    /// filter applying another (`map`) is guarded the same way. A filter or
+    /// test is looked up first, on every path: an unknown name fails as
+    /// unknown, and the guard is only ever asked about one that exists. A call
+    /// of a value with no name, `(expr)(...)`, is [`CallKind::Object`].
     pub fn set_call_guard<F>(&mut self, f: F)
     where
         F: Fn(&State, CallKind, &str, &[Value]) -> Result<Option<Value>, Error>

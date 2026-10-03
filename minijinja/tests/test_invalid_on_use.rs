@@ -147,3 +147,70 @@ fn a_guard_can_refuse_a_function_or_a_method() {
     assert_eq!(render(&env, "{{ range(3) }}").unwrap(), "no range");
     assert_eq!(render(&env, "{{ {'a': 1}.items() }}").unwrap(), "no items");
 }
+
+/// Every place a held value is used raises, the parts of an expression
+/// included: an item key, a slice bound, an autoescape mode.
+#[test]
+fn on_use_the_parts_of_an_expression_are_used_too() {
+    let env = on_use();
+    for source in [
+        "{{ {'a': 1}[secret] }}",
+        "{{ [1, 2][secret] }}",
+        "{{ [1, 2][secret:] }}",
+        "{{ [1, 2][:secret] }}",
+        "{{ [1, 2][::secret] }}",
+        "{% autoescape secret %}{{ '<' }}{% endautoescape %}",
+    ] {
+        assert!(failed(render(&env, source)), "{source} should raise");
+    }
+}
+
+/// A containment check reads an iterable once: one that yields its items only
+/// once still answers.
+#[test]
+fn on_use_a_containment_check_reads_an_iterable_once() {
+    let env = on_use();
+    let once = Value::make_one_shot_iterator([1, 2, 3].into_iter().map(Value::from));
+    let rv = env
+        .render_str(
+            "{{ 2 in it }}|{{ 2 not in it2 }}",
+            minijinja::context! {
+                it => once,
+                it2 => Value::make_one_shot_iterator([1, 2].into_iter().map(Value::from)),
+            },
+        )
+        .unwrap();
+    assert_eq!(rv, "True|False");
+}
+
+/// A call of a value with no name is guarded too, as an object call.
+#[test]
+fn a_guard_sees_a_call_with_no_name() {
+    let mut env = on_use();
+    env.add_function("make", || Value::from_function(|| "called"));
+    env.set_call_guard(|_, kind, name, _| {
+        Ok((kind == CallKind::Object && name.is_empty()).then(|| Value::from("guarded")))
+    });
+    assert_eq!(render(&env, "{{ (make())() }}").unwrap(), "guarded");
+}
+
+/// The guard is asked only about a filter or test that exists, on every path.
+#[test]
+fn an_unknown_name_fails_as_unknown_before_the_guard() {
+    let mut env = on_use();
+    env.set_call_guard(|_, _, name, _| Ok((name == "nope").then(|| Value::from("guarded"))));
+    for source in [
+        "{{ 1 | nope }}",
+        "{{ [1] | map('nope') | list }}",
+        "{{ 1 is nope }}",
+    ] {
+        let err = render(&env, source).expect_err(source);
+        assert!(
+            matches!(
+                err.kind(),
+                ErrorKind::UnknownFilter | ErrorKind::UnknownTest
+            ),
+            "{source}: {err}"
+        );
+    }
+}
