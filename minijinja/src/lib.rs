@@ -234,7 +234,7 @@ pub use loader::path_loader;
 mod debug;
 
 pub use self::defaults::{default_auto_escape_callback, escape_formatter};
-pub use self::environment::Environment;
+pub use self::environment::{CallKind, Environment};
 pub use self::error::{Error, ErrorKind};
 pub use self::expression::Expression;
 pub use self::output::Output;

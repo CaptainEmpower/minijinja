@@ -273,6 +273,12 @@ impl<'template, 'env> State<'template, 'env> {
     /// assert_eq!(rv.as_str(), Some("HELLO WORLD"));
     /// ```
     pub fn apply_filter(&self, filter: &str, args: &[Value]) -> Result<Value, Error> {
+        if let Some(rv) = ok!(self
+            .env()
+            .guard_call(self, crate::CallKind::Filter, filter, args))
+        {
+            return Ok(rv);
+        }
         match self.env().get_filter(filter) {
             Some(filter) => filter.call(self, args),
             None => Err(Error::from(ErrorKind::UnknownFilter)),
@@ -291,6 +297,15 @@ impl<'template, 'env> State<'template, 'env> {
     /// assert!(rv);
     /// ```
     pub fn perform_test(&self, test: &str, args: &[Value]) -> Result<bool, Error> {
+        // A guard's value stands in for the test's result. A boolean is all
+        // this can return, so an invalid one raises here rather than being
+        // read as false.
+        if let Some(rv) = ok!(self
+            .env()
+            .guard_call(self, crate::CallKind::Test, test, args))
+        {
+            return rv.validate().map(|rv| rv.is_true());
+        }
         match self.env().get_test(test) {
             Some(test) => test.call(self, args).map(|x| x.is_true()),
             None => Err(Error::from(ErrorKind::UnknownTest)),

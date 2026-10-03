@@ -1311,10 +1311,10 @@ mod builtins {
         args: crate::value::Rest<Value>,
     ) -> Result<Vec<Value>, Error> {
         let mut rv = vec![];
-        let test = if let Some(test_name) = test_name {
+        let test = if let Some(ref test_name) = test_name {
             Some(ok!(state
                 .env()
-                .get_test(&test_name)
+                .get_test(test_name)
                 .ok_or_else(|| Error::from(ErrorKind::UnknownTest))))
         } else {
             None
@@ -1330,7 +1330,17 @@ mod builtins {
                     .into_iter()
                     .chain(args.0.iter().cloned())
                     .collect::<Vec<_>>();
-                ok!(test.call(state, &new_args)).is_true()
+                // Guarded as a template's own `value is name` would be; a
+                // guard's invalid value raises rather than reading as false.
+                match ok!(state.env().guard_call(
+                    state,
+                    crate::CallKind::Test,
+                    test_name.as_deref().unwrap_or_default(),
+                    &new_args
+                )) {
+                    Some(guarded) => ok!(guarded.validate()).is_true(),
+                    None => ok!(test.call(state, &new_args)).is_true(),
+                }
             } else {
                 test_value.is_true()
             };
@@ -1499,7 +1509,18 @@ mod builtins {
                 .into_iter()
                 .chain(args.iter().skip(1).cloned())
                 .collect::<Vec<_>>();
-            rv.push(ok!(filter.call(state, &new_args)));
+            // Guarded as a template's own `value|name` would be.
+            rv.push(
+                match ok!(state.env().guard_call(
+                    state,
+                    crate::CallKind::Filter,
+                    filter_name,
+                    &new_args
+                )) {
+                    Some(guarded) => guarded,
+                    None => ok!(filter.call(state, &new_args)),
+                },
+            );
         }
         Ok(rv)
     }

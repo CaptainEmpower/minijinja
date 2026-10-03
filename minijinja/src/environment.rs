@@ -20,6 +20,24 @@ use crate::vm::State;
 use crate::{defaults, functions};
 
 type FormatterFunc = dyn Fn(&mut Output, &State, &Value) -> Result<(), Error> + Sync + Send;
+
+type CallGuardFunc =
+    dyn Fn(&State, CallKind, &str, &[Value]) -> Result<Option<Value>, Error> + Sync + Send;
+
+/// The kind of call a [call guard](Environment::set_call_guard) is consulted
+/// about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CallKind {
+    /// A filter, `value|name`.
+    Filter,
+    /// A test, `value is name`.
+    Test,
+    /// A function, `name(...)`.
+    Function,
+    /// A method, `value.name(...)`. The receiver is the first argument.
+    Method,
+}
 type PathJoinFunc = dyn for<'s> Fn(&'s str, &'s str) -> Cow<'s, str> + Sync + Send;
 type UnknownMethodFunc =
     dyn Fn(&State, &Value, &str, &[Value]) -> Result<Value, Error> + Sync + Send;
@@ -78,6 +96,8 @@ pub struct Environment<'source> {
     undefined_behavior: UndefinedBehavior,
     formatter: Arc<FormatterFunc>,
     formatter_is_default: bool,
+    call_guard: Option<Arc<CallGuardFunc>>,
+    invalid_raises_on_use: bool,
     #[cfg(feature = "debug")]
     debug: bool,
     #[cfg(feature = "fuel")]
@@ -129,6 +149,8 @@ impl<'source> Environment<'source> {
             undefined_behavior: UndefinedBehavior::default(),
             formatter: default_formatter(),
             formatter_is_default: true,
+            call_guard: None,
+            invalid_raises_on_use: false,
             #[cfg(feature = "debug")]
             debug: cfg!(debug_assertions),
             #[cfg(feature = "fuel")]
@@ -152,6 +174,8 @@ impl<'source> Environment<'source> {
             undefined_behavior: UndefinedBehavior::default(),
             formatter: default_formatter(),
             formatter_is_default: true,
+            call_guard: None,
+            invalid_raises_on_use: false,
             #[cfg(feature = "debug")]
             debug: cfg!(debug_assertions),
             #[cfg(feature = "fuel")]
@@ -598,6 +622,62 @@ impl<'source> Environment<'source> {
     {
         self.formatter = Arc::new(f);
         self.formatter_is_default = false;
+    }
+
+    /// Makes an invalid value raise its error where it is *used* rather than
+    /// where it is *loaded*.
+    ///
+    /// By default an invalid value (one made from an [`Error`] with
+    /// [`Value::from`]) raises the moment the engine loads it: a variable
+    /// lookup, an attribute or item access, a loop step. With this enabled
+    /// those hold it instead, so a list literal can contain it and a filter
+    /// can receive it, and the error is raised when the value is used: an
+    /// operator, a truth test, an iteration over it, an attribute read from
+    /// it, a method called on it, or the value being printed.
+    ///
+    /// What a filter, test or function does with one is left to it -- and to a
+    /// [call guard](Self::set_call_guard), which can decide before the call.
+    pub fn set_invalid_raises_on_use(&mut self, yes: bool) {
+        self.invalid_raises_on_use = yes;
+    }
+
+    /// Whether [`set_invalid_raises_on_use`](Self::set_invalid_raises_on_use)
+    /// is enabled.
+    pub fn invalid_raises_on_use(&self) -> bool {
+        self.invalid_raises_on_use
+    }
+
+    /// Registers a function consulted before every filter, test, function and
+    /// method call, with the call's name and its arguments.
+    ///
+    /// It returns `Ok(None)` to let the call proceed, `Ok(Some(value))` to
+    /// skip the call and use `value` as its result -- for a test too, which
+    /// then yields `value` itself rather than a boolean -- or an error to fail
+    /// the call. It is consulted for calls a template makes and for calls made
+    /// through [`State::apply_filter`] and [`State::perform_test`], so a
+    /// filter applying another (`map`) is guarded the same way.
+    pub fn set_call_guard<F>(&mut self, f: F)
+    where
+        F: Fn(&State, CallKind, &str, &[Value]) -> Result<Option<Value>, Error>
+            + 'static
+            + Sync
+            + Send,
+    {
+        self.call_guard = Some(Arc::new(f));
+    }
+
+    /// Consults the call guard, if one is registered.
+    pub(crate) fn guard_call(
+        &self,
+        state: &State,
+        kind: CallKind,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Error> {
+        match self.call_guard {
+            Some(ref guard) => guard(state, kind, name, args),
+            None => Ok(None),
+        }
     }
 
     /// Enable or disable the debug mode.
