@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::compiler::instructions::{
     CompareOp, Instruction, Instructions, LOOP_FLAG_RECURSIVE, LOOP_FLAG_WITH_LOOP_VAR, MAX_LOCALS,
 };
-use crate::environment::Environment;
+use crate::environment::{CallKind, Environment};
 use crate::error::{Error, ErrorKind};
 use crate::output::{CaptureMode, Output};
 use crate::utils::{untrusted_size_hint, write_escaped, AutoEscape, UndefinedBehavior};
@@ -196,6 +196,7 @@ impl<'env> Vm<'env> {
     ) -> Result<Option<Value>, Error> {
         let initial_auto_escape = state.auto_escape.get();
         let undefined_behavior = state.undefined_behavior();
+        let raise_on_use = state.env().invalid_raises_on_use();
         let strict_undefined = matches!(
             undefined_behavior,
             UndefinedBehavior::Strict
@@ -274,6 +275,7 @@ impl<'env> Vm<'env> {
                 ($method:ident) => {{
                     b = stack.pop();
                     a = stack.pop();
+                    assert_usable!(a, b);
                     stack.push(ctx_ok!(ops::$method(&a, &b)));
                 }};
             }
@@ -282,6 +284,7 @@ impl<'env> Vm<'env> {
                 ($op:tt) => {{
                     b = stack.pop();
                     a = stack.pop();
+                    assert_usable!(a, b);
                     ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
                     ctx_ok!(undefined_behavior.assert_value_not_undefined(&b));
                     stack.push(Value::from(a $op b));
@@ -305,12 +308,33 @@ impl<'env> Vm<'env> {
                 };
             }
 
+            // Where an invalid value is *loaded*: raised here by default, and
+            // held when the environment asks for it to raise on use instead.
             macro_rules! assert_valid {
                 ($expr:expr) => {{
                     let val = $expr;
-                    match val.validate() {
-                        Ok(val) => val,
-                        Err(err) => bail!(err),
+                    if raise_on_use {
+                        val
+                    } else {
+                        match val.validate() {
+                            Ok(val) => val,
+                            Err(err) => bail!(err),
+                        }
+                    }
+                }};
+            }
+
+            // Where a value is *used*: an invalid one raises its error. Only
+            // reachable with `raise_on_use`, since otherwise it was raised
+            // when it was loaded.
+            macro_rules! assert_usable {
+                ($($val:expr),+) => {{
+                    if raise_on_use {
+                        $(
+                            if let ValueRepr::Invalid(_) = ($val).0 {
+                                bail!(($val).clone().validate().unwrap_err());
+                            }
+                        )+
                     }
                 }};
             }
@@ -336,6 +360,7 @@ impl<'env> Vm<'env> {
                 }
                 Instruction::Emit => {
                     let value = stack.pop();
+                    assert_usable!(value);
                     if self.env.is_default_formatter() {
                         if strict_undefined
                             && matches!(value.0, ValueRepr::Undefined(UndefinedType::Default))
@@ -357,6 +382,7 @@ impl<'env> Vm<'env> {
                 }
                 Instruction::GetAttr(name) => {
                     a = stack.pop();
+                    assert_usable!(a);
                     // This is a common enough operation that it's interesting to consider a fast
                     // path here.  This is slightly faster than the regular attr lookup because we
                     // do not need to pass down the error object for the more common success case.
@@ -382,6 +408,9 @@ impl<'env> Vm<'env> {
                 Instruction::GetItem => {
                     a = stack.pop();
                     b = stack.pop();
+                    // The key is compared with the container's keys, so it is
+                    // used as surely as the container is.
+                    assert_usable!(a, b);
                     stack.push(match b.get_item_opt(&a) {
                         Some(value) => assert_valid!(value),
                         None => ctx_ok!(undefined_behavior.handle_undefined(b.is_undefined())),
@@ -392,6 +421,7 @@ impl<'env> Vm<'env> {
                     let stop = stack.pop();
                     b = stack.pop();
                     a = stack.pop();
+                    assert_usable!(a, b, stop, step);
                     if a.is_undefined()
                         && matches!(
                             undefined_behavior,
@@ -440,12 +470,14 @@ impl<'env> Vm<'env> {
                     stack.push(Value::from_object(v))
                 }
                 Instruction::UnpackList(count) => {
+                    assert_usable!(stack.peek());
                     ctx_ok!(self.unpack_list(&mut stack, *count));
                 }
                 Instruction::UnpackLists(count) => {
                     let lists = Vec::from_iter((0..*count).map(|_| stack.pop()));
                     let mut len = 0;
                     for list in lists.into_iter().rev() {
+                        assert_usable!(list);
                         for item in ctx_ok!(list.try_iter()) {
                             stack.push(item);
                             len += 1;
@@ -468,11 +500,13 @@ impl<'env> Vm<'env> {
                 Instruction::Lte => op_binop!(<=),
                 Instruction::Not => {
                     a = stack.pop();
+                    assert_usable!(a);
                     stack.push(Value::from(!ctx_ok!(undefined_behavior.is_true(&a))));
                 }
                 Instruction::StringConcat => {
                     a = stack.pop();
                     b = stack.pop();
+                    assert_usable!(a, b);
                     ctx_ok!(undefined_behavior.assert_value_not_undefined(&b));
                     ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
                     stack.push(ops::string_concat(b, &a));
@@ -480,15 +514,17 @@ impl<'env> Vm<'env> {
                 Instruction::In => {
                     a = stack.pop();
                     b = stack.pop();
+                    assert_usable!(a, b);
                     // the in-operator can fail if either side is undefined and
                     // we are in strict mode.
                     ctx_ok!(state.undefined_behavior().assert_iterable(&a));
                     ctx_ok!(state.undefined_behavior().assert_value_not_undefined(&b));
-                    stack.push(ctx_ok!(ops::contains(&a, &b)));
+                    stack.push(ctx_ok!(contains(&a, &b, raise_on_use)));
                 }
                 Instruction::CompareAndPreserve(op) => {
                     b = stack.pop();
                     a = stack.pop();
+                    assert_usable!(a, b);
                     let result = match op {
                         CompareOp::Eq => {
                             ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
@@ -523,7 +559,7 @@ impl<'env> Vm<'env> {
                         CompareOp::In | CompareOp::NotIn => {
                             ctx_ok!(undefined_behavior.assert_iterable(&b));
                             ctx_ok!(undefined_behavior.assert_value_not_undefined(&a));
-                            let contains = ctx_ok!(ops::contains(&b, &a)).is_true();
+                            let contains = ctx_ok!(contains(&b, &a, raise_on_use)).is_true();
                             if matches!(op, CompareOp::NotIn) {
                                 !contains
                             } else {
@@ -536,6 +572,7 @@ impl<'env> Vm<'env> {
                 }
                 Instruction::Neg => {
                     a = stack.pop();
+                    assert_usable!(a);
                     stack.push(ctx_ok!(ops::neg(&a)));
                 }
                 Instruction::PushWith => {
@@ -561,6 +598,7 @@ impl<'env> Vm<'env> {
                 }
                 Instruction::PushLoop(flags) => {
                     a = stack.pop();
+                    assert_usable!(a);
                     ctx_ok!(self.push_loop(state, a, *flags, pc, next_loop_recursion_jump.take()));
                 }
                 Instruction::Iterate(jump_target) => {
@@ -583,12 +621,14 @@ impl<'env> Vm<'env> {
                 }
                 Instruction::JumpIfFalse(jump_target) => {
                     a = stack.pop();
+                    assert_usable!(a);
                     if !ctx_ok!(undefined_behavior.is_true(&a)) {
                         pc = *jump_target;
                         continue;
                     }
                 }
                 Instruction::JumpIfFalseOrPop(jump_target) => {
+                    assert_usable!(stack.peek());
                     if !ctx_ok!(undefined_behavior.is_true(stack.peek())) {
                         pc = *jump_target;
                         continue;
@@ -597,6 +637,7 @@ impl<'env> Vm<'env> {
                     }
                 }
                 Instruction::JumpIfTrueOrPop(jump_target) => {
+                    assert_usable!(stack.peek());
                     if ctx_ok!(undefined_behavior.is_true(stack.peek())) {
                         pc = *jump_target;
                         continue;
@@ -606,6 +647,9 @@ impl<'env> Vm<'env> {
                 }
                 Instruction::PushAutoEscape => {
                     a = stack.pop();
+                    // An invalid value has no string to name a mode by, and
+                    // reading it as none would turn escaping off.
+                    assert_usable!(a);
                     auto_escape_stack.push(state.auto_escape.get());
                     state
                         .auto_escape
@@ -634,7 +678,15 @@ impl<'env> Vm<'env> {
                         }));
                     let args = stack.get_call_args(*arg_count);
                     let arg_count = args.len();
-                    a = ctx_ok!(filter.call(state, args));
+                    a = match ctx_ok!(state.env().guard_call(
+                        state,
+                        CallKind::Filter,
+                        normalized_name.as_ref(),
+                        args
+                    )) {
+                        Some(rv) => rv,
+                        None => ctx_ok!(filter.call(state, args)),
+                    };
                     stack.drop_top(arg_count);
                     stack.push(a);
                 }
@@ -651,9 +703,20 @@ impl<'env> Vm<'env> {
                     }));
                     let args = stack.get_call_args(*arg_count);
                     let arg_count = args.len();
-                    a = ctx_ok!(test.call(state, args));
+                    // A guard's value is the test's result as it stands --
+                    // not a boolean -- so it can carry an invalid value on
+                    // to where it is used.
+                    a = match ctx_ok!(state.env().guard_call(
+                        state,
+                        CallKind::Test,
+                        normalized_name.as_ref(),
+                        args
+                    )) {
+                        Some(rv) => rv,
+                        None => Value::from(ctx_ok!(test.call(state, args)).is_true()),
+                    };
                     stack.drop_top(arg_count);
-                    stack.push(Value::from(a.is_true()));
+                    stack.push(a);
                 }
                 Instruction::CallFunction(name, arg_count) => {
                     let args = stack.get_call_args(*arg_count);
@@ -666,6 +729,12 @@ impl<'env> Vm<'env> {
                             ));
                         }
                         ctx_ok!(self.perform_super(state, out, true))
+                    } else if let Some(rv) =
+                        ctx_ok!(state
+                            .env()
+                            .guard_call(state, CallKind::Function, name, args))
+                    {
+                        rv
                     } else if let Some(func) = state.lookup(name) {
                         // calling loops is a special operation that starts the recursion process.
                         // this bypasses the actual `call` implementation which would just fail
@@ -679,6 +748,7 @@ impl<'env> Vm<'env> {
                             }
                             recurse_loop!(true, loop_object);
                         } else {
+                            assert_usable!(func);
                             ctx_ok!(func.call(state, args))
                         }
                     } else {
@@ -694,14 +764,22 @@ impl<'env> Vm<'env> {
                 Instruction::CallMethod(name, arg_count) => {
                     let args = stack.get_call_args(*arg_count);
                     let arg_count = args.len();
-                    a = ctx_ok!(args[0].call_method(state, name, &args[1..]));
+                    assert_usable!(args[0]);
+                    a = match ctx_ok!(state.env().guard_call(state, CallKind::Method, name, args)) {
+                        Some(rv) => rv,
+                        None => ctx_ok!(args[0].call_method(state, name, &args[1..])),
+                    };
                     stack.drop_top(arg_count);
                     stack.push(a);
                 }
                 Instruction::CallObject(arg_count) => {
                     let args = stack.get_call_args(*arg_count);
                     let arg_count = args.len();
-                    a = ctx_ok!(args[0].call(state, &args[1..]));
+                    assert_usable!(args[0]);
+                    a = match ctx_ok!(state.env().guard_call(state, CallKind::Object, "", args)) {
+                        Some(rv) => rv,
+                        None => ctx_ok!(args[0].call(state, &args[1..])),
+                    };
                     stack.drop_top(arg_count);
                     stack.push(a);
                 }
@@ -1142,6 +1220,32 @@ impl<'env> Vm<'env> {
             caller_reference: (flags & MACRO_CALLER) != 0,
         }));
     }
+}
+
+/// Whether `container` holds `needle`, as the `in` operator asks it.
+///
+/// Comparing with a value uses it, so with `raise_on_use` an invalid item of a
+/// sequence raises -- but only one the check reaches: the items are compared
+/// in order, in one pass, and a match before it ends the check. A mapping is
+/// checked by its keys, and a string by its text, so neither reads an invalid
+/// value. One pass matters: an iterable may yield its items only once.
+fn contains(container: &Value, needle: &Value, raise_on_use: bool) -> Result<Value, Error> {
+    if raise_on_use {
+        if let ValueRepr::Object(ref obj) = container.0 {
+            if matches!(obj.repr(), ObjectRepr::Seq | ObjectRepr::Iterable) {
+                for item in obj.try_iter().into_iter().flatten() {
+                    if let ValueRepr::Invalid(_) = item.0 {
+                        return Err(item.validate().unwrap_err());
+                    }
+                    if &item == needle {
+                        return Ok(Value::from(true));
+                    }
+                }
+                return Ok(Value::from(false));
+            }
+        }
+    }
+    ops::contains(container, needle)
 }
 
 #[inline(never)]

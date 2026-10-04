@@ -273,9 +273,17 @@ impl<'template, 'env> State<'template, 'env> {
     /// assert_eq!(rv.as_str(), Some("HELLO WORLD"));
     /// ```
     pub fn apply_filter(&self, filter: &str, args: &[Value]) -> Result<Value, Error> {
-        match self.env().get_filter(filter) {
-            Some(filter) => filter.call(self, args),
-            None => Err(Error::from(ErrorKind::UnknownFilter)),
+        // Looked up first, as a template's own `value|name` is: the guard is
+        // consulted about a filter that exists, never in place of one.
+        let Some(callable) = self.env().get_filter(filter) else {
+            return Err(Error::from(ErrorKind::UnknownFilter));
+        };
+        match ok!(self
+            .env()
+            .guard_call(self, crate::CallKind::Filter, filter, args))
+        {
+            Some(rv) => Ok(rv),
+            None => callable.call(self, args),
         }
     }
 
@@ -291,9 +299,18 @@ impl<'template, 'env> State<'template, 'env> {
     /// assert!(rv);
     /// ```
     pub fn perform_test(&self, test: &str, args: &[Value]) -> Result<bool, Error> {
-        match self.env().get_test(test) {
-            Some(test) => test.call(self, args).map(|x| x.is_true()),
-            None => Err(Error::from(ErrorKind::UnknownTest)),
+        // A guard's value stands in for the test's result. A boolean is all
+        // this can return, so an invalid one raises here rather than being
+        // read as false.
+        let Some(callable) = self.env().get_test(test) else {
+            return Err(Error::from(ErrorKind::UnknownTest));
+        };
+        match ok!(self
+            .env()
+            .guard_call(self, crate::CallKind::Test, test, args))
+        {
+            Some(rv) => rv.validate().map(|rv| rv.is_true()),
+            None => callable.call(self, args).map(|x| x.is_true()),
         }
     }
 
