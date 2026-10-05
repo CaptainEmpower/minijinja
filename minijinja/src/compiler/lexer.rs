@@ -221,9 +221,15 @@ fn skip_nl(mut rest: &str) -> (bool, usize) {
     (was_nl || rest.is_empty(), skip)
 }
 
+/// `s` without the indentation before a block tag, when that indentation is
+/// all that stands between the tag and the start of its line.
+///
+/// A line can end in `\r` as well as `\n`, as `should_lstrip_block` already
+/// reads it: a source whose newlines are all `\r` otherwise kept every
+/// indentation `lstrip_blocks` exists to remove.
 fn lstrip_block(s: &str) -> &str {
     let trimmed = s.trim_end_matches(|x: char| x.is_whitespace() && !is_nl(x));
-    if trimmed.is_empty() || trimmed.as_bytes().get(trimmed.len() - 1) == Some(&b'\n') {
+    if trimmed.is_empty() || trimmed.ends_with(is_nl) {
         trimmed
     } else {
         s
@@ -971,6 +977,15 @@ mod tests {
             skip_basic_tag("  raw  +%}", "raw", "%}", false),
             Some((10, Whitespace::Preserve))
         );
+    }
+
+    #[test]
+    fn test_lstrip_block_after_any_line_end() {
+        assert_eq!(lstrip_block("line1\n    "), "line1\n");
+        assert_eq!(lstrip_block("line1\r\n    "), "line1\r\n");
+        assert_eq!(lstrip_block("line1\r    "), "line1\r");
+        assert_eq!(lstrip_block("    "), "");
+        assert_eq!(lstrip_block("text    "), "text    ");
     }
 
     #[test]
