@@ -297,3 +297,15 @@ fn test_keep_string_escapes_leaves_ordinary_literals_alone() {
     assert_eq!(env.render_str(r#"{{ "a'b" }}"#, ()).unwrap(), "a'b");
     assert_eq!(env.render_str(r"{{ 'a\'b' | length }}", ()).unwrap(), "4");
 }
+
+#[test]
+fn test_lstrip_blocks_with_any_line_end() {
+    let mut env = Environment::new();
+    env.set_lstrip_blocks(true);
+    env.set_trim_blocks(true);
+    for nl in ["\n", "\r\n", "\r"] {
+        let source = format!("line1{nl}    {{% if true %}}{nl}x{nl}    {{% endif %}}{nl}line3{nl}");
+        let rendered = env.render_str(&source, ()).unwrap();
+        assert_eq!(rendered, format!("line1{nl}x{nl}line3"), "newline {nl:?}");
+    }
+}
