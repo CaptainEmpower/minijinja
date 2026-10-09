@@ -101,6 +101,7 @@ pub struct Environment<'source> {
     formatter_is_default: bool,
     call_guard: Option<Arc<CallGuardFunc>>,
     invalid_raises_on_use: bool,
+    native_captures: bool,
     #[cfg(feature = "debug")]
     debug: bool,
     #[cfg(feature = "fuel")]
@@ -154,6 +155,7 @@ impl<'source> Environment<'source> {
             formatter_is_default: true,
             call_guard: None,
             invalid_raises_on_use: false,
+            native_captures: false,
             #[cfg(feature = "debug")]
             debug: cfg!(debug_assertions),
             #[cfg(feature = "fuel")]
@@ -179,6 +181,7 @@ impl<'source> Environment<'source> {
             formatter_is_default: true,
             call_guard: None,
             invalid_raises_on_use: false,
+            native_captures: false,
             #[cfg(feature = "debug")]
             debug: cfg!(debug_assertions),
             #[cfg(feature = "fuel")]
@@ -642,6 +645,34 @@ impl<'source> Environment<'source> {
     /// [call guard](Self::set_call_guard), which can decide before the call.
     pub fn set_invalid_raises_on_use(&mut self, yes: bool) {
         self.invalid_raises_on_use = yes;
+    }
+
+    /// Answer a capture whose whole output is one value with that value.
+    ///
+    /// Jinja2's native environment concatenates output nodes with
+    /// `native_concat`: when a body produced exactly one node and that node is
+    /// not a string, the body's result is the node itself rather than its text.
+    /// It applies to every captured body --- `{% set %}` blocks, macro and
+    /// `caller()` bodies, filter blocks --- and to the template as a whole.
+    ///
+    /// With this set, a capture answers its sole emitted value when the value
+    /// is not a string and nothing else was written into the capture, and a
+    /// macro call does the same. [`Template::render_with_value`] answers the
+    /// template's own sole value. Measured on ansible-core 2.19.13:
+    /// `{% set x %}{{ 5 }}{% endset %}{{ x + 1 }}` is `6`, where the default
+    /// --- a captured body is always its text --- refuses `"5" + 1`.
+    ///
+    /// The default is `false`, which is Jinja2's ordinary (non-native)
+    /// environment.
+    ///
+    /// [`Template::render_with_value`]: crate::Template::render_with_value
+    pub fn set_native_captures(&mut self, yes: bool) {
+        self.native_captures = yes;
+    }
+
+    /// Whether [`set_native_captures`](Self::set_native_captures) is on.
+    pub fn native_captures(&self) -> bool {
+        self.native_captures
     }
 
     /// Whether [`set_invalid_raises_on_use`](Self::set_invalid_raises_on_use)

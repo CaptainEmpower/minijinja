@@ -191,6 +191,36 @@ impl<'env, 'source> Template<'env, 'source> {
         self._render(Value::from_serialize(&ctx)).map(|x| x.0)
     }
 
+    /// Like [`render`](Self::render), and also the template's sole value.
+    ///
+    /// With [`Environment::set_native_captures`] on, the second element is
+    /// the value the template emitted when its whole output was that one
+    /// value and the value is not a string --- Jinja2's native `concat` at the
+    /// top level. It is `None` otherwise, and always `None` with native
+    /// captures off.
+    ///
+    /// ```
+    /// # use minijinja::{Environment, context, value::Value};
+    /// let mut env = Environment::new();
+    /// env.set_native_captures(true);
+    /// let tmpl = env.template_from_str("{% if true %}{{ n }}{% endif %}").unwrap();
+    /// let (text, value) = tmpl.render_with_value(context!{ n => 5 }).unwrap();
+    /// assert_eq!(text, "5");
+    /// assert_eq!(value, Some(Value::from(5)));
+    /// ```
+    ///
+    /// [`Environment::set_native_captures`]: crate::Environment::set_native_captures
+    pub fn render_with_value<S: Serialize>(
+        &self,
+        ctx: S,
+    ) -> Result<(String, Option<Value>), Error> {
+        let mut rv = String::with_capacity(self.compiled.buffer_size_hint);
+        let mut out = Output::new(&mut rv);
+        ok!(self._eval(Value::from_serialize(&ctx), &mut out));
+        let value = out.sole_value();
+        Ok((rv, value))
+    }
+
     /// Like [`render`](Self::render) but also return the evaluated [`State`].
     ///
     /// This can be used to inspect the [`State`] of the template post evaluation

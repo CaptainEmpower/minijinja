@@ -126,14 +126,24 @@ impl Object for Macro {
         // anything other than strings (most importantly they) can't return
         // other macros this is however not an issue, as modifications in the
         // macro cannot leak out.
+        let mut out = Output::new(&mut rv);
         ok!(vm.eval_macro(
             state,
             self.macro_ref_id,
-            &mut Output::new(&mut rv),
+            &mut out,
             self.closure.clone(),
             caller,
             arg_values
         ));
+        // With native captures, a body whose whole output was one value
+        // answers that value, as Jinja2's native `concat` does. A macro ---
+        // one defined in the body among them --- is still answered as text,
+        // which keeps the property described above.
+        if let Some(value) = out.sole_value() {
+            if value.downcast_object_ref::<Macro>().is_none() {
+                return Ok(value);
+            }
+        }
 
         Ok(if !matches!(state.auto_escape(), AutoEscape::None) {
             Value::from_safe_string(rv)

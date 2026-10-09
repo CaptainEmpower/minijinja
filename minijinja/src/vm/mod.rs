@@ -174,6 +174,9 @@ impl<'env> Vm<'env> {
         stack: Stack,
         pc: u32,
     ) -> Result<Option<Value>, Error> {
+        if self.env.native_captures() {
+            out.track_native();
+        }
         #[cfg(feature = "stacker")]
         {
             stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
@@ -361,6 +364,7 @@ impl<'env> Vm<'env> {
                 Instruction::Emit => {
                     let value = stack.pop();
                     assert_usable!(value);
+                    out.begin_value(&value);
                     if self.env.is_default_formatter() {
                         if strict_undefined
                             && matches!(value.0, ValueRepr::Undefined(UndefinedType::Default))
@@ -371,6 +375,7 @@ impl<'env> Vm<'env> {
                     } else {
                         ctx_ok!(self.env.format(&value, state, out));
                     }
+                    out.end_value();
                 }
                 Instruction::StoreLocal(name) => {
                     state.ctx.store(name, stack.pop());

@@ -23,6 +23,25 @@ pub struct Output<'a> {
     w: *mut (dyn fmt::Write + 'a),
     target: *mut (dyn fmt::Write + 'a),
     capture_stack: Vec<Option<String>>,
+    /// One per frame --- the root, then one per capture --- while native
+    /// captures are on; empty otherwise.
+    frames: Vec<Frame>,
+}
+
+/// What a frame's output has been so far, for native captures.
+#[derive(Default)]
+struct Frame {
+    written: Written,
+    /// Inside an emission: writes are the value's own text.
+    in_value: bool,
+}
+
+#[derive(Default)]
+enum Written {
+    #[default]
+    Nothing,
+    Sole(Value),
+    Mixed,
 }
 
 impl<'a> Output<'a> {
@@ -32,6 +51,7 @@ impl<'a> Output<'a> {
             w,
             target: w,
             capture_stack: Vec::new(),
+            frames: Vec::new(),
         }
     }
 
@@ -44,6 +64,55 @@ impl<'a> Output<'a> {
             w: NullWriter::get_mut(),
             target: NullWriter::get_mut(),
             capture_stack: vec![None],
+            frames: Vec::new(),
+        }
+    }
+
+    /// Starts tracking frames for native captures, if it has not started.
+    ///
+    /// Called by the engine when the environment has native captures on. A
+    /// frame is pushed for the root and for every capture already open, so
+    /// the stacks stay aligned whenever tracking starts.
+    pub(crate) fn track_native(&mut self) {
+        while self.frames.len() <= self.capture_stack.len() {
+            self.frames.push(Frame::default());
+        }
+    }
+
+    /// Marks the start of one emitted value's text in the current frame.
+    pub(crate) fn begin_value(&mut self, value: &Value) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.written = match frame.written {
+                Written::Nothing => Written::Sole(value.clone()),
+                _ => Written::Mixed,
+            };
+            frame.in_value = true;
+        }
+    }
+
+    /// Marks the end of the value [`begin_value`](Self::begin_value) began.
+    pub(crate) fn end_value(&mut self) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.in_value = false;
+        }
+    }
+
+    /// Records a write that is not an emitted value's own text.
+    #[inline(always)]
+    fn note_write(&mut self) {
+        if let Some(frame) = self.frames.last_mut() {
+            if !frame.in_value {
+                frame.written = Written::Mixed;
+            }
+        }
+    }
+
+    /// The root frame's sole value, if its whole output was one value that
+    /// is not a string.
+    pub(crate) fn sole_value(&mut self) -> Option<Value> {
+        match self.frames.first_mut() {
+            Some(frame) => native(std::mem::take(&mut frame.written)),
+            None => None,
         }
     }
 
@@ -53,11 +122,22 @@ impl<'a> Output<'a> {
             CaptureMode::Capture => Some(String::new()),
             CaptureMode::Discard => None,
         });
+        if !self.frames.is_empty() {
+            self.frames.push(Frame::default());
+        }
         self.retarget();
     }
 
     /// Ends capturing and returns the captured string as value.
+    ///
+    /// With native captures tracked, a capture whose whole output was one
+    /// value that is not a string returns that value instead.
     pub(crate) fn end_capture(&mut self, auto_escape: AutoEscape) -> Value {
+        let sole = if self.frames.len() > 1 {
+            self.frames.pop().and_then(|frame| native(frame.written))
+        } else {
+            None
+        };
         let rv = if let Some(captured) = self.capture_stack.pop().unwrap() {
             if !matches!(auto_escape, AutoEscape::None) {
                 Value::from_safe_string(captured)
@@ -68,7 +148,10 @@ impl<'a> Output<'a> {
             Value::UNDEFINED
         };
         self.retarget();
-        rv
+        match sole {
+            Some(value) if !rv.is_undefined() => value,
+            _ => rv,
+        }
     }
 
     fn retarget(&mut self) {
@@ -96,12 +179,16 @@ impl<'a> Output<'a> {
     /// Writes some data to the underlying buffer contained within this output.
     #[inline]
     pub fn write_str(&mut self, s: &str) -> fmt::Result {
+        if !s.is_empty() {
+            self.note_write();
+        }
         self.target().write_str(s)
     }
 
     /// Writes some formatted information into this instance.
     #[inline]
     pub fn write_fmt(&mut self, a: fmt::Arguments<'_>) -> fmt::Result {
+        self.note_write();
         self.target().write_fmt(a)
     }
 }
@@ -109,17 +196,35 @@ impl<'a> Output<'a> {
 impl fmt::Write for Output<'_> {
     #[inline]
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        fmt::Write::write_str(self.target(), s)
+        Output::write_str(self, s)
     }
 
     #[inline]
     fn write_char(&mut self, c: char) -> fmt::Result {
+        self.note_write();
         fmt::Write::write_char(self.target(), c)
     }
 
     #[inline]
     fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
-        fmt::Write::write_fmt(self.target(), args)
+        Output::write_fmt(self, args)
+    }
+}
+
+/// A frame's native result: its sole value, unless that is a string --- a
+/// string is its own text, and answering the text keeps a safe string safe ---
+/// or undefined, which a lenient engine renders as nothing.
+fn native(written: Written) -> Option<Value> {
+    match written {
+        Written::Sole(value)
+            if !matches!(
+                value.kind(),
+                crate::value::ValueKind::String | crate::value::ValueKind::Undefined
+            ) =>
+        {
+            Some(value)
+        }
+        _ => None,
     }
 }
 
