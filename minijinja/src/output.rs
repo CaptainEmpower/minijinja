@@ -214,8 +214,14 @@ impl fmt::Write for Output<'_> {
 /// A frame's native result: its sole value, unless that is a string --- a
 /// string is its own text, and answering the text keeps a safe string safe ---
 /// or undefined, which a lenient engine renders as nothing.
+///
+/// A frame that wrote nothing at all is `none`, as Jinja2's native `concat`
+/// answers `None` for an empty node list: an empty `{% set %}` block, an
+/// empty macro or `caller()` body, a filter block over nothing and a
+/// template whose output is empty are all `NoneType` in ansible-core.
 fn native(written: Written) -> Option<Value> {
     match written {
+        Written::Nothing => Some(Value::from(())),
         Written::Sole(value)
             if !matches!(
                 value.kind(),
