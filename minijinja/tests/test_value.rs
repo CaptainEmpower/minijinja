@@ -257,7 +257,7 @@ fn test_builtin_seq_objects() {
         "{{ val }}",
         val => Value::from_object(vec!["foo", "bar"]),
     );
-    assert_snapshot!(rv, @r###"["foo", "bar"]"###);
+    assert_snapshot!(rv, @"['foo', 'bar']");
 }
 
 #[test]
@@ -760,7 +760,7 @@ fn test_reverse() {
     assert_eq!(odd_map.len(), Some(3));
     assert_snapshot!(
         render!("{% set r = m|reverse %}{{ m }}|{{ r }}|{{ r }}", m => odd_map),
-        @r###"{"a": "a", "b": "b", "c": "c"}|["c", "b", "a"]|["c", "b", "a"]"###
+        @"{'a': 'a', 'b': 'b', 'c': 'c'}|['c', 'b', 'a']|['c', 'b', 'a']"
     );
 
     #[derive(Debug)]
@@ -932,7 +932,7 @@ fn test_object_hash_map() {
             .collect::<Vec<_>>(),
         vec!["foo"]
     );
-    assert_eq!(value.to_string(), "{\"foo\": 1}");
+    assert_eq!(value.to_string(), "{'foo': 1}");
 
     let value = Value::from(HashMap::from_iter([(Value::from(true), 1i32)]));
     assert_eq!(
@@ -980,7 +980,7 @@ fn test_object_btree_map() {
             .collect::<Vec<_>>(),
         vec!["foo"]
     );
-    assert_eq!(value.to_string(), "{\"foo\": 1}");
+    assert_eq!(value.to_string(), "{'foo': 1}");
 
     let value = Value::from(BTreeMap::from_iter([(Value::from(true), 1i32)]));
     assert_eq!(
@@ -1047,8 +1047,8 @@ fn test_map_eq() {
     let t1 = Value::from_object(Thing { rev: false });
     let t2 = Value::from_object(Thing { rev: true });
 
-    assert_snapshot!(t1.to_string(), @r###"{"a": 1, "b": 2}"###);
-    assert_snapshot!(t2.to_string(), @r###"{"b": 2, "a": 1}"###);
+    assert_snapshot!(t1.to_string(), @"{'a': 1, 'b': 2}");
+    assert_snapshot!(t2.to_string(), @"{'b': 2, 'a': 1}");
     assert_eq!(t1, t2);
 }
 

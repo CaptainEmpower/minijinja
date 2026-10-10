@@ -294,6 +294,41 @@ pub trait Object: fmt::Debug + Send + Sync {
     where
         Self: Sized + 'static,
     {
+        // Unless asked for the alternate (pretty debug) form, a sequence or a
+        // map renders as Python's `str()` renders it -- its `repr`, with a
+        // string inside quoted `'a'` the Python way -- because that is what
+        // Jinja2 prints, and so what every string coercion of a container
+        // (`~`, `join`, `format`, a string filter) produces upstream. The
+        // scalars' `Display` is already Python's (`None`, `True`, `1.0`).
+        if !f.alternate() {
+            match self.repr() {
+                ObjectRepr::Map => {
+                    f.write_str("{")?;
+                    for (index, (key, value)) in
+                        self.try_iter_pairs().into_iter().flatten().enumerate()
+                    {
+                        if index > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write_python_repr(f, &key)?;
+                        f.write_str(": ")?;
+                        write_python_repr(f, &value)?;
+                    }
+                    return f.write_str("}");
+                }
+                ObjectRepr::Seq | ObjectRepr::Iterable if self.enumerator_len().is_some() => {
+                    f.write_str("[")?;
+                    for (index, value) in self.try_iter().into_iter().flatten().enumerate() {
+                        if index > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write_python_repr(f, &value)?;
+                    }
+                    return f.write_str("]");
+                }
+                _ => {}
+            }
+        }
         match self.repr() {
             ObjectRepr::Map => {
                 let mut dbg = f.debug_map();
@@ -884,6 +919,54 @@ impl Hash for DynObject {
             }
         }
     }
+}
+
+/// Writes `value` as Python's `repr` writes it, for an item inside a container.
+///
+/// A string is quoted the way `repr` quotes it: single quotes unless it holds
+/// one and no double quote, with backslashes, the chosen quote, `\n`, `\r`,
+/// `\t` and other unprintable characters escaped. Anything else is its
+/// `Display`, which is already Python's for the scalars and recurses through
+/// [`Object::render`] for a nested container. An undefined item keeps its
+/// debug spelling.
+fn write_python_repr(f: &mut fmt::Formatter<'_>, value: &Value) -> fmt::Result {
+    match value.kind() {
+        crate::value::ValueKind::String => match value.as_str() {
+            Some(text) => write_python_quoted(f, text),
+            None => write!(f, "{value:?}"),
+        },
+        crate::value::ValueKind::Undefined => write!(f, "{value:?}"),
+        _ => write!(f, "{value}"),
+    }
+}
+
+/// Quotes `text` as Python's `repr` quotes a `str`.
+fn write_python_quoted(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
+    use std::fmt::Write as _;
+    let quote = if text.contains('\'') && !text.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    f.write_char(quote)?;
+    for c in text.chars() {
+        match c {
+            '\\' => f.write_str("\\\\")?,
+            '\n' => f.write_str("\\n")?,
+            '\r' => f.write_str("\\r")?,
+            '\t' => f.write_str("\\t")?,
+            c if c == quote => {
+                f.write_char('\\')?;
+                f.write_char(c)?;
+            }
+            c if (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)) => {
+                write!(f, "\\x{:02x}", c as u32)?
+            }
+            c @ ('\u{2028}' | '\u{2029}') => write!(f, "\\u{:04x}", c as u32)?,
+            c => f.write_char(c)?,
+        }
+    }
+    f.write_char(quote)
 }
 
 impl fmt::Display for DynObject {
