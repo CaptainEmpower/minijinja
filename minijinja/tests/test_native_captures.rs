@@ -150,3 +150,27 @@ fn a_macro_object_is_not_returned_from_a_macro() {
                   {{ outer() is string }}";
     assert_eq!(render(&env, source).0, "True");
 }
+
+/// An empty capture is `none`, as Jinja2's native `concat` answers `None` for
+/// an empty node list. Measured on ansible-core 2.21.5, each is `NoneType`.
+#[test]
+fn an_empty_capture_is_none() {
+    for source in [
+        "{% set x %}{% endset %}{{ x }}",
+        "{% set x %}{% if false %}a{% endif %}{% endset %}{{ x }}",
+        "{% macro m() %}{% endmacro %}{{ m() }}",
+        "{% macro m() %}{{ caller() }}{% endmacro %}{% call m() %}{% endcall %}",
+    ] {
+        assert_eq!(kind_of(source), ValueKind::None, "{source}");
+    }
+    // A template whose own output is empty answers `none` too.
+    assert_eq!(
+        render(&native_env(), "{% if false %}x{% endif %}").1,
+        Some(Value::from(()))
+    );
+    // Whitespace is text, not nothing.
+    assert_eq!(
+        kind_of("{% set x %} {% endset %}{{ x }}"),
+        ValueKind::String
+    );
+}
