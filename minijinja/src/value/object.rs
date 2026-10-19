@@ -220,6 +220,17 @@ pub trait Object: fmt::Debug + Send + Sync {
         self.enumerate().query_len()
     }
 
+    /// Answers `key in self` for an object of [`ObjectRepr::Map`].
+    ///
+    /// The default looks the key up with [`get_value`](Self::get_value),
+    /// which is right for an object whose values already exist. An object
+    /// that computes a value when it is looked up -- one rendered on read,
+    /// say -- implements this to answer from its keys alone, so a
+    /// containment check does not compute the value it does not use.
+    fn contains_key(self: &Arc<Self>, key: &Value) -> bool {
+        self.get_value(key).is_some()
+    }
+
     /// Returns `true` if this object is considered true for if conditions.
     ///
     /// The default implementation checks if the [`enumerator_len`](Self::enumerator_len)
@@ -863,6 +874,8 @@ type_erase! {
         fn get_value(&self, key: &Value) -> Option<Value>;
 
         fn get_value_by_str(&self, key: &str) -> Option<Value>;
+
+        fn contains_key(&self, key: &Value) -> bool;
 
         fn enumerate(&self) -> Enumerator;
 
