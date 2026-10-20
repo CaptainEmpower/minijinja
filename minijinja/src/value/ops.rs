@@ -480,7 +480,7 @@ pub fn contains(container: &Value, value: &Value) -> Result<Value, Error> {
     } else if let ValueRepr::Object(ref obj) = container.0 {
         match obj.repr() {
             ObjectRepr::Plain => false,
-            ObjectRepr::Map => obj.get_value(value).is_some(),
+            ObjectRepr::Map => obj.contains_key(value),
             ObjectRepr::Seq | ObjectRepr::Iterable => {
                 obj.try_iter().into_iter().flatten().any(|v| &v == value)
             }
