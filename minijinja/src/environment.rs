@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use crate::compiler::codegen::CodeGenerator;
 use crate::compiler::instructions::Instructions;
+use crate::compiler::lexer::WhitespaceConfig;
 use crate::compiler::parser::parse_expr;
 use crate::error::{attach_basic_debug_info, Error, ErrorKind};
 use crate::expression::Expression;
@@ -304,6 +305,16 @@ impl<'source> Environment<'source> {
     /// inline --- `regex_replace('\b(?!dev)(\w+)-', 'X-')` --- where
     /// unescaping turns `\b` into a backspace and the pattern silently stops
     /// matching.
+    ///
+    /// It holds inside `{{ }}` and in a standalone expression
+    /// ([`compile_expression`](Self::compile_expression)) only. A literal in a
+    /// `{% %}` block is unescaped whatever this says, because Ansible's
+    /// `escape_backslashes` doubles a literal's backslashes only between
+    /// `{{` and `}}`: measured on ansible-core 2.19.13,
+    /// `{% set s = '\n' %}{{ s | length }}` is 1.
+    /// [`compile_expression_unescaped`](Self::compile_expression_unescaped)
+    /// compiles an expression with every literal unescaped, which is how
+    /// Ansible evaluates a conditional.
     ///
     /// The default is `false`, which is Jinja2's behaviour.
     ///
@@ -825,7 +836,25 @@ impl<'source> Environment<'source> {
     /// scripting language.  For more information and an
     /// example see [`Expression`].
     pub fn compile_expression(&self, expr: &'source str) -> Result<Expression<'_, 'source>, Error> {
-        self._compile_expression(expr)
+        self._compile_expression(expr, self.template_config().ws_config)
+            .map(|instr| Expression::new(self, instr))
+    }
+
+    /// Compiles an expression whose string literals are all unescaped.
+    ///
+    /// This works exactly like [`compile_expression`](Self::compile_expression),
+    /// except that [`keep_string_escapes`](Self::set_keep_string_escapes) is
+    /// ignored: `'\n'` is a newline here, as it is under Jinja2. Ansible
+    /// evaluates a conditional this way -- `when: x == "\t"` compares with a
+    /// tab, measured on ansible-core 2.19.13 -- while the same literal inside
+    /// `{{ }}` keeps its backslash.
+    pub fn compile_expression_unescaped(
+        &self,
+        expr: &'source str,
+    ) -> Result<Expression<'_, 'source>, Error> {
+        let mut ws_config = self.template_config().ws_config;
+        ws_config.keep_string_escapes = false;
+        self._compile_expression(expr, ws_config)
             .map(|instr| Expression::new(self, instr))
     }
 
@@ -838,7 +867,7 @@ impl<'source> Environment<'source> {
         E: Into<Cow<'source, str>>,
     {
         crate::loader::OwnedInstructions::try_new(Box::from(expr.into()), |expr| {
-            self._compile_expression(expr)
+            self._compile_expression(expr, self.template_config().ws_config)
         })
         .map(|instr| Expression::new_owned(self, instr))
     }
@@ -852,12 +881,16 @@ impl<'source> Environment<'source> {
         &self.templates.template_config
     }
 
-    fn _compile_expression<'expr>(&self, expr: &'expr str) -> Result<Instructions<'expr>, Error> {
+    fn _compile_expression<'expr>(
+        &self,
+        expr: &'expr str,
+        ws_config: WhitespaceConfig,
+    ) -> Result<Instructions<'expr>, Error> {
         attach_basic_debug_info(
             parse_expr(
                 expr,
                 self.template_config().syntax_config.clone(),
-                self.template_config().ws_config,
+                ws_config,
             )
             .map(|ast| {
                 let mut g = CodeGenerator::new("<expression>", expr);

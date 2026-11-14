@@ -216,6 +216,7 @@ mod expression;
 mod format_utils;
 mod output;
 mod template;
+mod unescape;
 mod utils;
 mod vendor;
 mod vm;

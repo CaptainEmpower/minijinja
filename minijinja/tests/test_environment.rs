@@ -309,3 +309,65 @@ fn test_lstrip_blocks_with_any_line_end() {
         assert_eq!(rendered, format!("line1{nl}x{nl}line3"), "newline {nl:?}");
     }
 }
+
+/// `keep_string_escapes` holds inside `{{ }}` only; a `{% %}` literal is
+/// unescaped either way.
+///
+/// That is Ansible's `escape_backslashes`, which doubles a literal's
+/// backslashes only between `{{` and `}}`. Measured on ansible-core 2.19.13:
+///
+/// ```text
+/// {% set s = '\n' %}{{ s | length }}                   1
+/// {% set s = 'a\tb' %}{{ s | length }}|{{ 'a\tb' | length }}   3|4
+/// {% if '\x41' == 'A' %}yes{% endif %}                 yes
+/// ```
+#[test]
+fn test_keep_string_escapes_leaves_block_literals_unescaped() {
+    let mut env = Environment::new();
+    env.set_keep_string_escapes(true);
+
+    for (template, expected) in [
+        (r"{% set s = '\n' %}{{ s | length }}", "1"),
+        (
+            r"{% set s = 'a\tb' %}{{ s | length }}|{{ 'a\tb' | length }}",
+            "3|4",
+        ),
+        (r"{% if '\x41' == 'A' %}yes{% else %}no{% endif %}", "yes"),
+        (r"{% for c in 'a\nb' %}[{{ c }}]{% endfor %}", "[a][\n][b]"),
+    ] {
+        assert_eq!(
+            env.render_str(template, ()).unwrap(),
+            expected,
+            "{template}"
+        );
+    }
+}
+
+/// `compile_expression_unescaped` unescapes whatever `keep_string_escapes`
+/// says: Ansible evaluates a conditional with `escape_backslashes=False`, so
+/// `when: x == "\t"` compares with a tab (ansible-core 2.19.13).
+#[test]
+fn test_compile_expression_unescaped_ignores_keep_string_escapes() {
+    let mut env = Environment::new();
+    env.set_keep_string_escapes(true);
+
+    let unescaped = env.compile_expression_unescaped(r"'\n' | length").unwrap();
+    assert_eq!(unescaped.eval(()).unwrap().to_string(), "1");
+    let kept = env.compile_expression(r"'\n' | length").unwrap();
+    assert_eq!(kept.eval(()).unwrap().to_string(), "2");
+    assert!(env.keep_string_escapes());
+}
+
+/// A literal decodes as Python's `unicode-escape`, as Jinja2's lexer decodes
+/// one: `\/` keeps its backslash, `\a` is the bell, `\U` names any character.
+#[test]
+fn test_string_escapes_decode_as_python_does() {
+    let env = Environment::new();
+
+    assert_eq!(env.render_str(r#"{{ "a\/b" }}"#, ()).unwrap(), r"a\/b");
+    assert_eq!(env.render_str(r#"{{ "x\ay" | length }}"#, ()).unwrap(), "3");
+    assert_eq!(env.render_str(r#"{{ "\U00000041" }}"#, ()).unwrap(), "A");
+    assert_eq!(env.render_str(r#"{{ "\v" | length }}"#, ()).unwrap(), "1");
+    let err = env.render_str(r#"{{ "\x4" }}"#, ()).unwrap_err();
+    assert_eq!(err.kind(), minijinja::ErrorKind::BadEscape);
+}
