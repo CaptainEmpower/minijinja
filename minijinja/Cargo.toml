@@ -35,6 +35,7 @@ deserialization = []
 debug = []
 loader = []
 unicode = ["unicode-ident", "unicase"]
+unicode_names = ["dep:unicode_names2"]
 custom_syntax = ["dep:aho-corasick"]
 std_collections = []
 serde = []
@@ -75,6 +76,7 @@ memo-map = "0.3.1"
 unicode-ident = { version = "1.0.5", optional = true }
 unicase = { version = "2.6.0", optional = true }
 stacker = { version = "0.1.15", optional = true }
+unicode_names2 = { version = "4.0.0", optional = true }
 
 [dev-dependencies]
 insta = { version = "1.38.0", features = ["glob", "serde"] }

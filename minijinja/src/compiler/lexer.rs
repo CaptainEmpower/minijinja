@@ -4,7 +4,8 @@ use std::ops::ControlFlow;
 use crate::compiler::tokens::{Span, Token};
 use crate::error::{Error, ErrorKind};
 use crate::syntax::SyntaxConfig;
-use crate::utils::{memchr, memstr, unescape};
+use crate::unescape::unescape;
+use crate::utils::{memchr, memstr};
 
 /// Internal config struct to control whitespace in the engine.
 #[derive(Copy, Clone, Debug, Default)]
@@ -12,7 +13,8 @@ pub struct WhitespaceConfig {
     pub keep_trailing_newline: bool,
     pub lstrip_blocks: bool,
     pub trim_blocks: bool,
-    /// Take a string literal's backslashes literally rather than unescaping.
+    /// Take a `{{ }}` string literal's backslashes literally rather than
+    /// unescaping them; a `{% %}` literal is unescaped either way.
     ///
     /// See [`Environment::set_keep_string_escapes`](crate::Environment::set_keep_string_escapes).
     pub keep_string_escapes: bool,
@@ -558,10 +560,14 @@ impl<'s> Tokenizer<'s> {
             return Err(self.syntax_error("unexpected end of string"));
         }
         let s = self.advance(str_len + 2);
-        // With `keep_string_escapes`, a backslash is an ordinary character and
-        // the literal is borrowed as written -- the same path an unescaped
-        // literal already takes, so it costs nothing.
-        Ok(if has_escapes && !self.ws_config.keep_string_escapes {
+        // With `keep_string_escapes`, a backslash in a `{{ }}` literal is an
+        // ordinary character and the literal is borrowed as written -- the
+        // same path an unescaped literal already takes, so it costs nothing.
+        // A `{% %}` literal is decoded either way, as Ansible's
+        // `escape_backslashes` leaves it.
+        let keep = self.ws_config.keep_string_escapes
+            && matches!(self.stack.last(), Some(LexerState::Variable));
+        Ok(if has_escapes && !keep {
             (
                 Token::String(ok!(unescape(&s[1..s.len() - 1])).into_boxed_str()),
                 self.span(old_loc),
